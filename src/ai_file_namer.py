@@ -1618,17 +1618,19 @@ class App(tk.Tk):
             self.status_var.set("Switch to Remote mode to connect OpenAI OAuth.")
             return
 
-        # Keep connect behavior browser-first: if Client ID is missing, send users straight
-        # to OpenAI setup docs instead of silently failing or requiring guesswork.
+        # Keep connect behavior true OAuth-only: no token copy/paste should ever be needed.
+        # If Client ID is missing we fail fast with guidance, rather than sending users to
+        # unrelated pages that feel like a non-OAuth login flow.
         if not self.openai_client_id_var.get().strip():
-            webbrowser.open(OPENAI_OAUTH_APP_SETUP_URL, new=1)
-            messagebox.showinfo(
-                "OpenAI OAuth setup required",
-                "OpenAI OAuth needs a Client ID for desktop PKCE sign-in.\n\n"
-                "A browser tab was opened to OpenAI setup. After creating/copying a Client ID, "
-                "paste it into AI Provider settings and click Connect OpenAI again.",
+            messagebox.showerror(
+                "OpenAI OAuth Client ID missing",
+                "OpenAI browser OAuth requires a configured Client ID.\n\n"
+                "Set OPENAI_OAUTH_CLIENT_ID (recommended) or enter a Client ID in AI Provider settings, "
+                "then click Connect OpenAI again.\n\n"
+                "After that, sign-in happens in-browser and returns to this app automatically—"
+                "no manual token copy/paste is needed.",
             )
-            self.status_var.set("Opened OpenAI setup in browser. Add Client ID, then retry Connect OpenAI.")
+            self.status_var.set("OpenAI OAuth Client ID is missing. Configure it, then retry Connect OpenAI.")
             return
 
         self.oauth_in_progress = True
@@ -1807,7 +1809,7 @@ class App(tk.Tk):
         )
         ttk.Label(
             frame,
-            text="Tip: Use OAuth Connect for OpenAI remote mode. Tokens are saved locally for reuse.",
+            text="Tip: Connect OpenAI launches browser OAuth and returns here automatically (no token copy/paste).",
             foreground="#666",
         ).grid(row=8, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
 
