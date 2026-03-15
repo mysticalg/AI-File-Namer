@@ -1,0 +1,109 @@
+name: Build Installers
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build Windows EXE + MSI
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller cx-Freeze
+
+      - name: Run tests
+        shell: bash
+        run: |
+          python -m unittest discover -s tests -v
+
+      - name: Build Windows EXE (PyInstaller)
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name AIFileNamer src/ai_file_namer.py
+
+      - name: Build Windows MSI (cx_Freeze)
+        shell: bash
+        run: |
+          python packaging/setup_windows.py bdist_msi
+
+      - name: Collect Windows artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts/windows
+          cp dist/AIFileNamer/AIFileNamer.exe artifacts/windows/AIFileNamer.exe
+          find dist -maxdepth 1 -name "*.msi" -exec cp {} artifacts/windows/ \;
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: artifacts/windows/*
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS APP + PKG
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Run tests
+        run: |
+          python -m unittest discover -s tests -v
+
+      - name: Build macOS APP (PyInstaller)
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name AIFileNamer src/ai_file_namer.py
+
+      - name: Build macOS PKG installer
+        run: |
+          rm -rf pkgroot
+          mkdir -p pkgroot/Applications
+          cp -R dist/AIFileNamer.app pkgroot/Applications/
+          pkgbuild \
+            --root pkgroot \
+            --identifier com.aifilenamer.app \
+            --version 1.0.0 \
+            --install-location / \
+            AIFileNamer-macOS.pkg
+
+      - name: Collect macOS artifacts
+        run: |
+          mkdir -p artifacts/macos
+          cp -R dist/AIFileNamer.app artifacts/macos/
+          cp AIFileNamer-macOS.pkg artifacts/macos/
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installers
+          path: artifacts/macos/*
+          if-no-files-found: error

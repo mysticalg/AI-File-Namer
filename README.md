@@ -28,3 +28,20 @@ python src/ai_file_namer.py
 ## Notes
 - The model should return concise names. The app sanitizes output for Windows-safe filenames.
 - Keep local/remote AI endpoint available for fast response.
+
+## CI: Build installers automatically
+A GitHub Actions workflow is included at `.github/workflows/build-installers.yml`.
+
+It runs on pushes, PRs, and manual dispatch and produces:
+- **Windows**
+  - `AIFileNamer.exe` via PyInstaller
+  - `.msi` installer via cx_Freeze (`bdist_msi`)
+- **macOS**
+  - `AIFileNamer.app` via PyInstaller
+  - `AIFileNamer-macOS.pkg` installer via `pkgbuild`
+
+All outputs are uploaded as workflow artifacts:
+- `windows-installers`
+- `macos-installers`
+
+> Note: unsigned macOS/Windows installers may trigger security prompts until code-signing is configured.
