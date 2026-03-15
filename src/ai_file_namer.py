@@ -36,7 +36,7 @@ DEFAULT_REMOTE_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 DEFAULT_LOCAL_MODEL = "llava"
 DEFAULT_REMOTE_MODEL = "gpt-4o-mini"
 DEFAULT_AI_TIMEOUT_SECONDS = 120
-DEFAULT_OPENAI_OAUTH_CLIENT_ID = "change-me-openai-oauth-client-id"
+DEFAULT_OPENAI_OAUTH_CLIENT_ID = os.environ.get("OPENAI_OAUTH_CLIENT_ID", "")
 DEFAULT_OPENAI_OAUTH_AUTH_URL = "https://auth.openai.com/oauth/authorize"
 DEFAULT_OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 DEFAULT_OPENAI_OAUTH_SCOPE = "openid profile offline_access"
@@ -44,6 +44,7 @@ DEFAULT_OPENAI_OAUTH_REDIRECT_HOST = "127.0.0.1"
 DEFAULT_OPENAI_OAUTH_REDIRECT_PORT = 8765
 OLLAMA_DOWNLOAD_URL = "https://ollama.com/download"
 OPENAI_REGISTRATION_URL = "https://platform.openai.com/signup"
+OPENAI_OAUTH_APP_SETUP_URL = "https://platform.openai.com/settings/organization/general"
 
 
 def default_settings_path() -> Path:
@@ -134,8 +135,10 @@ class OpenAIOAuthClient:
         """Run OAuth Authorization Code + PKCE flow and return token payload."""
         import requests
 
-        if not self.client_id or self.client_id == DEFAULT_OPENAI_OAUTH_CLIENT_ID:
-            raise ValueError("Set your OpenAI OAuth Client ID before connecting.")
+        if not self.client_id:
+            raise ValueError(
+                "OpenAI OAuth Client ID is missing. Add it in AI Provider settings or set OPENAI_OAUTH_CLIENT_ID."
+            )
 
         redirect_uri = (
             f"http://{DEFAULT_OPENAI_OAUTH_REDIRECT_HOST}:{DEFAULT_OPENAI_OAUTH_REDIRECT_PORT}/oauth/callback"
@@ -553,10 +556,10 @@ class AIProvider:
         preferences: FilenamePreferences,
         extra_instruction: str = "",
     ) -> Dict[str, object]:
-        """Request a full-tree folder-only restructure plan.
+        """Request a full-tree folder+file restructure plan.
 
         The planner works from the root inventory in one pass and returns a complete
-        folder path proposal rather than recursively planning each subtree.
+        path proposal rather than recursively planning each subtree.
         """
         import requests
 
@@ -568,15 +571,16 @@ class AIProvider:
             "Use root context (root name, parent name, and full root path) to infer domain and naming intent. "
             "For example, if context suggests Music/Artist/Bach, expand cryptic catalog labels into meaningful work names when confident. "
             "Return JSON only with shape: "
-            "{\"operations\": [{\"type\": \"folder\", \"source\": \"relative/path\", \"destination\": \"relative/parent/path\"}], "
+            "{\"operations\": [{\"type\": \"folder\"|\"file\", \"source\": \"relative/path\", \"destination\": \"relative/path\"}], "
             "\"reorganized_structure\": [\"relative/final/folder/path\"], "
             "\"dedupe_files\": true}. "
-            "Only include folder operations, never file operations. "
-            "Destination is the target parent path, not final file/folder name. "
+            "For folder operations: destination is the target parent path (not final folder name). "
+            "For file operations: destination may be a target folder path or a full new file path including a renamed filename. "
             "The reorganized_structure list must represent the full final folder tree from the root. "
             "Plan once from the root inventory (do not recursively re-plan each subfolder). "
             "Use shallow logical categories and consolidate duplicates. "
             "Avoid over-nesting and avoid creating one-off folders when an existing shared category works. "
+            "Use file extensions to infer media/document categories and improve consistency of file naming. "
             f"Use {style_description} and {case_description}. "
             "Do not include markdown. "
             "Every source folder should appear exactly once in operations (unless intentionally unchanged). "
@@ -858,15 +862,19 @@ def build_ollama_missing_guidance(error_text: str) -> str:
 
 
 def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
-    """Build a compact folder-only representation for AI restructure planning.
+    """Build a compact folder+file representation for AI restructure planning.
 
     The payload intentionally avoids redundant per-row keys so AI requests stay
     small and fast while still preserving enough tree context to plan moves.
     """
     folders = collect_subfolders(folder, recursive=recursive)
+    files = sorted(path for path in folder.glob("**/*" if recursive else "*") if path.is_file())
     max_nodes = 240
+    max_files = 420
     folder_paths = [str(path.relative_to(folder)).replace("\\", "/") for path in folders]
     sampled_paths = folder_paths[:max_nodes]
+    file_paths = [str(path.relative_to(folder)).replace("\\", "/") for path in files]
+    sampled_files = file_paths[:max_files]
     direct_children_map: Dict[str, List[str]] = {}
     for subfolder in folders[:max_nodes]:
         rel = str(subfolder.relative_to(folder)).replace("\\", "/")
@@ -882,8 +890,11 @@ def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
         "root_parent_name": folder.parent.name,
         # One list of relative folder paths is enough to describe restructure sources.
         "folder_paths": sampled_paths,
+        # Include sampled file paths so the planner can suggest tidy file/folder moves too.
+        "file_paths": sampled_files,
         # Root-level cardinality helps the model estimate plan scope without row bloat.
         "total_folder_count": len(folders),
+        "total_file_count": len(files),
         # Optional child hints preserve local hierarchy without repeating each folder row.
         "direct_children": direct_children_map,
     }
@@ -942,7 +953,12 @@ def sanitize_restructure_operations(
     root: Path,
     preferences: FilenamePreferences,
 ) -> List[FolderStructureSuggestion]:
-    """Validate and sanitize AI-proposed operations into executable move suggestions."""
+    """Validate and sanitize AI-proposed operations into executable move suggestions.
+
+    Supports both folder and file operations. Folder destinations are treated as
+    parent paths. File destinations may be either parent folders or full file
+    targets with a renamed filename.
+    """
 
     def _normalize_segment_for_compare(segment: str) -> str:
         """Create a stable comparison key for path-segment equality checks."""
@@ -958,7 +974,7 @@ def sanitize_restructure_operations(
         source_raw = str(operation.get("source", "")).strip().replace("\\", "/")
         destination_raw = str(operation.get("destination", "")).strip().replace("\\", "/")
         item_type = str(operation.get("type", "folder")).strip().lower()
-        if not source_raw or item_type != "folder":
+        if not source_raw or item_type not in {"folder", "file"}:
             continue
 
         source_rel = normalize_ai_source_relative_path(source_raw, root)
@@ -972,37 +988,82 @@ def sanitize_restructure_operations(
             continue
         if not source_path.exists():
             continue
+        if item_type == "folder" and not source_path.is_dir():
+            continue
+        if item_type == "file" and not source_path.is_file():
+            continue
 
-        # destination is a parent path for the source item; blank means move to root.
+        # destination is a parent path for folders; for files we also accept a full
+        # file path including a renamed leaf name.
         sanitized_destination_parent = normalize_ai_destination_relative_path(
             destination_raw=destination_raw,
             root=root,
             preferences=preferences,
         )
-        source_name = sanitize_filename_stem(
-            source_path.name,
-            separator=preferences.separator,
-            capitalization=preferences.capitalization,
-            max_length=preferences.max_folder_name_length,
-        )
-        if not source_name:
-            source_name = source_path.name
+        destination_raw_clean = destination_raw.strip().replace("\\", "/").strip("/")
+        if destination_raw_clean.startswith(f"{root.name}/"):
+            destination_raw_clean = destination_raw_clean[len(root.name) + 1 :]
+        if item_type == "file":
+            stem_budget = max(1, preferences.max_filename_length - len(source_path.suffix))
+            normalized_stem = sanitize_filename_stem(
+                source_path.stem,
+                separator=preferences.separator,
+                capitalization=preferences.capitalization,
+                max_length=stem_budget,
+            )
+            source_name = f"{normalized_stem or source_path.stem}{source_path.suffix.lower()}"
+        else:
+            source_name = sanitize_filename_stem(
+                source_path.name,
+                separator=preferences.separator,
+                capitalization=preferences.capitalization,
+                max_length=preferences.max_folder_name_length,
+            )
+            if not source_name:
+                source_name = source_path.name
 
-        # Some models ignore the "destination is a parent path" requirement and
-        # return a full target path that already includes the source folder name.
-        # Detect that case so we do not append the name twice (e.g. Cache/Cache).
+        # Some models return full target paths while others return parent paths.
+        # Detect and normalize both styles while preserving safe naming.
         target_relative = source_name
         if sanitized_destination_parent:
             destination_parts = [part for part in Path(sanitized_destination_parent).parts if part not in (".", "..")]
             destination_tail = destination_parts[-1] if destination_parts else ""
-            if destination_tail and _normalize_segment_for_compare(destination_tail) == _normalize_segment_for_compare(source_name):
+            if item_type == "folder" and destination_tail and _normalize_segment_for_compare(destination_tail) == _normalize_segment_for_compare(source_name):
                 target_relative = "/".join(destination_parts)
+            elif item_type == "file" and destination_raw_clean.lower().endswith(source_path.suffix.lower()):
+                # For files, a destination that includes an extension is treated as full file target.
+                raw_parts = [part for part in Path(destination_raw_clean).parts if part not in (".", "..")]
+                raw_tail = raw_parts[-1] if raw_parts else destination_tail
+                normalized_file_name = sanitize_filename_stem(
+                    Path(raw_tail).stem,
+                    separator=preferences.separator,
+                    capitalization=preferences.capitalization,
+                    max_length=max(1, preferences.max_filename_length - len(source_path.suffix)),
+                )
+                if not normalized_file_name:
+                    normalized_file_name = source_path.stem
+                file_leaf = f"{normalized_file_name}{source_path.suffix.lower()}"
+                sanitized_parent_parts = [
+                    sanitize_filename_stem(
+                        part,
+                        separator=preferences.separator,
+                        capitalization=preferences.capitalization,
+                        max_length=preferences.max_folder_name_length,
+                    )
+                    or part
+                    for part in raw_parts[:-1]
+                ]
+                target_relative = "/".join([*sanitized_parent_parts, file_leaf])
             else:
                 target_relative = "/".join([*destination_parts, source_name])
 
         # Extra safety net: collapse accidental duplicate trailing segments.
         target_parts = [part for part in Path(target_relative).parts if part not in (".", "..")]
-        while len(target_parts) >= 2 and _normalize_segment_for_compare(target_parts[-1]) == _normalize_segment_for_compare(target_parts[-2]):
+        while (
+            item_type == "folder"
+            and len(target_parts) >= 2
+            and _normalize_segment_for_compare(target_parts[-1]) == _normalize_segment_for_compare(target_parts[-2])
+        ):
             target_parts.pop()
         target_relative = "/".join(target_parts) or source_name
 
@@ -1557,6 +1618,19 @@ class App(tk.Tk):
             self.status_var.set("Switch to Remote mode to connect OpenAI OAuth.")
             return
 
+        # Keep connect behavior browser-first: if Client ID is missing, send users straight
+        # to OpenAI setup docs instead of silently failing or requiring guesswork.
+        if not self.openai_client_id_var.get().strip():
+            webbrowser.open(OPENAI_OAUTH_APP_SETUP_URL, new=1)
+            messagebox.showinfo(
+                "OpenAI OAuth setup required",
+                "OpenAI OAuth needs a Client ID for desktop PKCE sign-in.\n\n"
+                "A browser tab was opened to OpenAI setup. After creating/copying a Client ID, "
+                "paste it into AI Provider settings and click Connect OpenAI again.",
+            )
+            self.status_var.set("Opened OpenAI setup in browser. Add Client ID, then retry Connect OpenAI.")
+            return
+
         self.oauth_in_progress = True
         if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
             self.oauth_connect_button.configure(state="disabled")
@@ -1703,27 +1777,39 @@ class App(tk.Tk):
 
         ttk.Label(frame, text="OpenAI OAuth Client ID").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Entry(frame, textvariable=self.openai_client_id_var).grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        ttk.Label(
+            frame,
+            text="Tip: Set OPENAI_OAUTH_CLIENT_ID env var to prefill this automatically.",
+            foreground="#666",
+        ).grid(row=4, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
 
         oauth_controls = ttk.Frame(frame)
-        oauth_controls.grid(row=4, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        oauth_controls.grid(row=5, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
         self.oauth_connect_button = ttk.Button(oauth_controls, text="🔐 Connect OpenAI", command=self._start_openai_oauth_login)
         self.oauth_connect_button.pack(side=tk.LEFT)
         self.oauth_disconnect_button = ttk.Button(oauth_controls, text="🧹 Forget Token", command=self._clear_openai_token)
         self.oauth_disconnect_button.pack(side=tk.LEFT, padx=(6, 0))
+        oauth_setup_button = ttk.Button(
+            oauth_controls,
+            text="ℹ️ OAuth Setup Help",
+            command=lambda: webbrowser.open(OPENAI_OAUTH_APP_SETUP_URL, new=1),
+        )
+        oauth_setup_button.pack(side=tk.LEFT, padx=(6, 0))
+        self._attach_tooltip(oauth_setup_button, "Open OpenAI docs/settings to create or find your OAuth Client ID.")
 
-        ttk.Label(frame, text="Token Status").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(frame, text="Token Status").grid(row=5, column=0, sticky="w", padx=8, pady=(8, 0))
         self.oauth_status_label = ttk.Label(frame, text="Not connected", foreground="#666")
-        self.oauth_status_label.grid(row=5, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
+        self.oauth_status_label.grid(row=6, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
 
-        ttk.Label(frame, text="⏱️ AI timeout (sec)").grid(row=6, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(frame, text="⏱️ AI timeout (sec)").grid(row=7, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Spinbox(frame, from_=30, to=3600, increment=30, textvariable=self.ai_timeout_seconds_var, width=10).grid(
-            row=6, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
+            row=7, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
         )
         ttk.Label(
             frame,
             text="Tip: Use OAuth Connect for OpenAI remote mode. Tokens are saved locally for reuse.",
             foreground="#666",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
+        ).grid(row=8, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
 
         self._handle_mode_change()
         self._refresh_oauth_status_label()

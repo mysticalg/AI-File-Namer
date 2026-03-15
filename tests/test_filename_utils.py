@@ -240,9 +240,10 @@ class FilenameUtilsTests(unittest.TestCase):
             ]
 
             suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
-            self.assertEqual(len(suggestions), 1)
-            self.assertEqual(suggestions[0].item_type, "folder")
-            self.assertIn("Music", suggestions[0].target_relative)
+            # Invalid path is filtered, while valid folder+file operations are preserved.
+            self.assertEqual(len(suggestions), 2)
+            self.assertEqual(sorted(item.item_type for item in suggestions), ["file", "folder"])
+            self.assertTrue(all("Music" in item.target_relative for item in suggestions))
 
     def test_normalize_ai_source_relative_path_strips_root_prefix(self):
         root = Path("/tmp/Bach")
@@ -366,7 +367,7 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertEqual(len(suggestions), 1)
             self.assertEqual(suggestions[0].target_relative, "Music/Vocal/Acapella/Artists Alphabetical/0")
 
-    def test_sanitize_restructure_operations_ignores_file_operations(self):
+    def test_sanitize_restructure_operations_supports_file_operations(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             folder = root / "media"
@@ -386,9 +387,34 @@ class FilenameUtilsTests(unittest.TestCase):
             ]
 
             suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
-            self.assertEqual(suggestions, [])
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0].item_type, "file")
+            self.assertEqual(suggestions[0].target_relative, "video/clips/clip.mp4")
 
-    def test_build_folder_inventory_returns_folder_only_payload(self):
+    def test_sanitize_restructure_operations_supports_file_rename_destination(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            folder = root / "media"
+            folder.mkdir()
+            (folder / "clip.mp4").write_text("x")
+
+            preferences = FilenamePreferences(
+                separator="_",
+                capitalization="lower",
+                max_filename_length=96,
+                max_folder_name_length=32,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {"type": "file", "source": "media/clip.mp4", "destination": "video/highlights/my best clip.mp4"},
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0].target_relative, "video/highlights/my_best_clip.mp4")
+
+    def test_build_folder_inventory_returns_compact_tree_payload(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             (root / "photos" / "travel").mkdir(parents=True)
@@ -400,8 +426,9 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertEqual(inventory["root"], root.name)
             self.assertIn("root_full_path", inventory)
             self.assertIn("root_parent_name", inventory)
-            self.assertNotIn("files", inventory)
-            self.assertNotIn("file_count", inventory)
+            self.assertIn("file_paths", inventory)
+            self.assertIn("total_file_count", inventory)
+            self.assertIn("photos/image1.jpg", inventory["file_paths"])
             self.assertIn("folder_paths", inventory)
             self.assertGreaterEqual(len(inventory["folder_paths"]), 3)
             self.assertEqual(inventory["total_folder_count"], len(inventory["folder_paths"]))
