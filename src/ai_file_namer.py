@@ -858,32 +858,34 @@ def build_ollama_missing_guidance(error_text: str) -> str:
 
 
 def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
-    """Build a compact folder-only representation for AI restructure planning."""
+    """Build a compact folder-only representation for AI restructure planning.
+
+    The payload intentionally avoids redundant per-row keys so AI requests stay
+    small and fast while still preserving enough tree context to plan moves.
+    """
     folders = collect_subfolders(folder, recursive=recursive)
     max_nodes = 240
-    folder_rows: List[Dict[str, object]] = []
     folder_paths = [str(path.relative_to(folder)).replace("\\", "/") for path in folders]
+    sampled_paths = folder_paths[:max_nodes]
+    direct_children_map: Dict[str, List[str]] = {}
     for subfolder in folders[:max_nodes]:
         rel = str(subfolder.relative_to(folder)).replace("\\", "/")
         direct_folders = [child.name for child in sorted(subfolder.iterdir()) if child.is_dir()]
-        folder_rows.append(
-            {
-                "folder": rel,
-                # Keep payload folder-only so restructure prompts stay focused and lightweight.
-                "direct_subfolder_count": len(direct_folders),
-                "sample_subfolders": direct_folders[:8],
-            }
-        )
+        # Include only nodes that actually have children to avoid repetitive noise.
+        if direct_folders:
+            direct_children_map[rel] = direct_folders[:8]
 
     return {
         "root": folder.name,
         # Include root context so the model can infer domain (e.g., Music/Artists/Bach).
         "root_full_path": str(folder.resolve()),
         "root_parent_name": folder.parent.name,
-        "folder_count": len(folders),
-        # Full path list helps the model return one complete grouped structure in one response.
-        "all_folder_paths": folder_paths[:600],
-        "folders": folder_rows,
+        # One list of relative folder paths is enough to describe restructure sources.
+        "folder_paths": sampled_paths,
+        # Root-level cardinality helps the model estimate plan scope without row bloat.
+        "total_folder_count": len(folders),
+        # Optional child hints preserve local hierarchy without repeating each folder row.
+        "direct_children": direct_children_map,
     }
 
 

@@ -402,12 +402,12 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertIn("root_parent_name", inventory)
             self.assertNotIn("files", inventory)
             self.assertNotIn("file_count", inventory)
-            self.assertIn("all_folder_paths", inventory)
-            self.assertGreaterEqual(len(inventory["all_folder_paths"]), 3)
-            first_row = inventory["folders"][0]
-            self.assertIn("direct_subfolder_count", first_row)
-            self.assertIn("sample_subfolders", first_row)
-            self.assertNotIn("sample_files", first_row)
+            self.assertIn("folder_paths", inventory)
+            self.assertGreaterEqual(len(inventory["folder_paths"]), 3)
+            self.assertEqual(inventory["total_folder_count"], len(inventory["folder_paths"]))
+            self.assertIn("direct_children", inventory)
+            self.assertIn("photos", inventory["direct_children"])
+            self.assertEqual(sorted(inventory["direct_children"]["photos"]), ["family", "travel"])
 
     def test_format_restructure_preview_paths_outputs_old_new_and_transition(self):
         old_path, new_path, transition = format_restructure_preview_paths(
