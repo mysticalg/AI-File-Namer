@@ -394,6 +394,7 @@ class AIProvider:
         case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
         prompt = (
             "You are organizing a messy folder tree. "
+            "Primary goal: consolidate and simplify the tree so it has fewer, clearer folders. "
             "Return JSON only with shape: "
             "{\"operations\": [{\"type\": \"folder\", \"source\": \"relative/path\", \"destination\": \"relative/parent/path\"}], "
             "\"reorganized_structure\": [\"relative/final/folder/path\"], "
@@ -403,6 +404,7 @@ class AIProvider:
             "The reorganized_structure list must represent the full final folder tree from the root. "
             "Plan once from the root inventory (do not recursively re-plan each subfolder). "
             "Use shallow logical categories and consolidate duplicates. "
+            "Avoid over-nesting and avoid creating one-off folders when an existing shared category works. "
             f"Use {style_description} and {case_description}. "
             "Do not include markdown. "
             "Every source folder should appear exactly once in operations (unless intentionally unchanged). "
@@ -1569,7 +1571,8 @@ class App(tk.Tk):
                 retry_hint = (
                     "The previous response missed these source folders: "
                     f"{json.dumps(missing_sources[:120])}. "
-                    "Return one complete plan that covers the entire folder tree in a single response."
+                    "Return one complete plan that covers the entire folder tree in a single response, "
+                    "while still prioritizing consolidation into fewer, clearer categories."
                 )
                 plan = provider.suggest_restructure_plan(
                     inventory=inventory,
