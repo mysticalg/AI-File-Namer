@@ -19,6 +19,7 @@ from src.ai_file_namer import (
     sanitize_category_path,
     sanitize_restructure_operations,
     build_folder_inventory,
+    find_missing_restructure_sources,
     sanitize_filename_stem,
 )
 
@@ -227,6 +228,8 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertEqual(inventory["root"], root.name)
             self.assertNotIn("files", inventory)
             self.assertNotIn("file_count", inventory)
+            self.assertIn("all_folder_paths", inventory)
+            self.assertGreaterEqual(len(inventory["all_folder_paths"]), 3)
             first_row = inventory["folders"][0]
             self.assertIn("direct_subfolder_count", first_row)
             self.assertIn("sample_subfolders", first_row)
@@ -260,6 +263,31 @@ class FilenameUtilsTests(unittest.TestCase):
         payload = {"x": "a" * 6000}
         result = summarize_debug_payload(payload, max_chars=120)
         self.assertIn("truncated", result)
+
+
+    def test_find_missing_restructure_sources_identifies_uncovered_folders(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "photos").mkdir()
+            (root / "videos").mkdir()
+
+            preferences = FilenamePreferences(
+                separator="_",
+                capitalization="lower",
+                max_filename_length=96,
+                max_folder_name_length=32,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [{"type": "folder", "source": "photos", "destination": "media"}]
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+
+            missing = find_missing_restructure_sources(
+                suggestions=suggestions,
+                root=root,
+                candidate_folders=collect_subfolders(root, recursive=False),
+            )
+            self.assertEqual(missing, ["videos"])
 
 
 if __name__ == "__main__":

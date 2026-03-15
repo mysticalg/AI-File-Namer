@@ -377,7 +377,12 @@ class AIProvider:
         )
 
 
-    def suggest_restructure_plan(self, inventory: Dict[str, object], preferences: FilenamePreferences) -> Dict[str, object]:
+    def suggest_restructure_plan(
+        self,
+        inventory: Dict[str, object],
+        preferences: FilenamePreferences,
+        extra_instruction: str = "",
+    ) -> Dict[str, object]:
         """Request a full-tree folder-only restructure plan.
 
         The planner works from the root inventory in one pass and returns a complete
@@ -400,6 +405,9 @@ class AIProvider:
             "Use shallow logical categories and consolidate duplicates. "
             f"Use {style_description} and {case_description}. "
             "Do not include markdown. "
+            "Every source folder should appear exactly once in operations (unless intentionally unchanged). "
+            "Group semantically similar folders under shared parent categories. "
+            f"{extra_instruction} "
             f"Inventory: {json.dumps(inventory)}"
         )
 
@@ -530,6 +538,7 @@ def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
     folders = collect_subfolders(folder, recursive=recursive)
     max_nodes = 240
     folder_rows: List[Dict[str, object]] = []
+    folder_paths = [str(path.relative_to(folder)).replace("\\", "/") for path in folders]
     for subfolder in folders[:max_nodes]:
         rel = str(subfolder.relative_to(folder)).replace("\\", "/")
         direct_folders = [child.name for child in sorted(subfolder.iterdir()) if child.is_dir()]
@@ -545,8 +554,21 @@ def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
     return {
         "root": folder.name,
         "folder_count": len(folders),
+        # Full path list helps the model return one complete grouped structure in one response.
+        "all_folder_paths": folder_paths[:600],
         "folders": folder_rows,
     }
+
+
+def find_missing_restructure_sources(
+    suggestions: Sequence[FolderStructureSuggestion],
+    root: Path,
+    candidate_folders: Sequence[Path],
+) -> List[str]:
+    """Return relative folder paths missing from the AI move suggestions."""
+    expected = {str(path.relative_to(root)).replace("\\", "/") for path in candidate_folders}
+    provided = {item.original_relative.replace("\\", "/") for item in suggestions}
+    return sorted(expected - provided)
 
 
 def format_restructure_preview_paths(original_relative: str, target_relative: str) -> Tuple[str, str, str]:
@@ -1345,9 +1367,46 @@ class App(tk.Tk):
             raw_operations = plan.get("operations", []) if isinstance(plan, dict) else []
             operation_rows = raw_operations if isinstance(raw_operations, list) else []
             sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
+
+            missing_sources = find_missing_restructure_sources(
+                suggestions=sanitized,
+                root=folder,
+                candidate_folders=candidate_folders,
+            )
+
+            # Retry once with targeted guidance if the first plan does not cover the full tree.
+            if missing_sources:
+                retry_hint = (
+                    "The previous response missed these source folders: "
+                    f"{json.dumps(missing_sources[:120])}. "
+                    "Return one complete plan that covers the entire folder tree in a single response."
+                )
+                plan = provider.suggest_restructure_plan(
+                    inventory=inventory,
+                    preferences=preferences,
+                    extra_instruction=retry_hint,
+                )
+                raw_operations = plan.get("operations", []) if isinstance(plan, dict) else []
+                operation_rows = raw_operations if isinstance(raw_operations, list) else []
+                sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
+                missing_sources = find_missing_restructure_sources(
+                    suggestions=sanitized,
+                    root=folder,
+                    candidate_folders=candidate_folders,
+                )
         except Exception as exc:  # noqa: BLE001
             self.ui_queue.put(("status", f"Restructure planning failed: {exc}"))
             return
+
+        if missing_sources:
+            self.ui_queue.put(
+                (
+                    "status",
+                    "AI plan is partial. "
+                    f"Covered {len(candidate_folders) - len(missing_sources)}/{len(candidate_folders)} folders. "
+                    "Review suggestions and rerun if needed.",
+                )
+            )
 
         self.folder_structure_suggestions = sanitized
         for idx, proposal in enumerate(self.folder_structure_suggestions, start=1):
