@@ -25,10 +25,36 @@ from src.ai_file_namer import (
     sanitize_filename_stem,
     build_ollama_tags_endpoint,
     parse_ollama_model_names,
+    load_app_settings,
+    save_app_settings,
 )
 
 
 class FilenameUtilsTests(unittest.TestCase):
+
+    def test_load_app_settings_returns_empty_for_missing_or_invalid_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings_path = Path(tmp_dir) / "settings.json"
+            self.assertEqual(load_app_settings(settings_path), {})
+
+            settings_path.write_text("not-json", encoding="utf-8")
+            self.assertEqual(load_app_settings(settings_path), {})
+
+    def test_save_and_load_app_settings_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings_path = Path(tmp_dir) / "settings.json"
+            payload = {
+                "provider_mode": "Remote (OpenAI-compatible /v1/chat/completions)",
+                "endpoint": "https://example.test/v1/chat/completions",
+                "recursive_scan": False,
+                "max_filename_length": 88,
+            }
+
+            save_app_settings(payload, settings_path)
+            loaded = load_app_settings(settings_path)
+
+            self.assertEqual(loaded, payload)
+
     def test_sanitize_filename_stem_defaults_to_underscores(self):
         raw = "A Cute Cat!!!\n(indoors)"
         self.assertEqual(sanitize_filename_stem(raw), "a_cute_cat_indoors")

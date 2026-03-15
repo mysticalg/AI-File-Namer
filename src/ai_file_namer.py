@@ -14,7 +14,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -24,6 +24,48 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".webm", ".mpeg"}
 SUPPORTED_MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 INVALID_FILENAME_CHARS = r'<>:"/\\|?*'
 MAX_WINDOWS_FILENAME_LENGTH = 255
+SETTINGS_FILE_NAME = ".ai_file_namer_settings.json"
+DEFAULT_LOCAL_MODE = "Local (Ollama /api/generate)"
+DEFAULT_REMOTE_MODE = "Remote (OpenAI-compatible /v1/chat/completions)"
+DEFAULT_LOCAL_ENDPOINT = "http://localhost:11434/api/generate"
+DEFAULT_REMOTE_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+DEFAULT_LOCAL_MODEL = "llava"
+DEFAULT_REMOTE_MODEL = "gpt-4o-mini"
+
+
+def default_settings_path() -> Path:
+    """Return the per-user settings file used to persist UI preferences."""
+    return Path.home() / SETTINGS_FILE_NAME
+
+
+def load_app_settings(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load persisted settings from disk and fail safely on invalid data."""
+    settings_path = path or default_settings_path()
+    if not settings_path.exists():
+        return {}
+    try:
+        loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def save_app_settings(settings: Dict[str, Any], path: Optional[Path] = None) -> None:
+    """Persist app settings so users keep their preferences between sessions."""
+    settings_path = path or default_settings_path()
+    try:
+        settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        # Ignore persistence failures to keep the UI responsive and non-blocking.
+        return
+
+
+def _coerce_int_setting(value: Any, default: int) -> int:
+    """Convert persisted values to int without crashing when settings files are edited manually."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -944,25 +986,34 @@ class App(tk.Tk):
         self.geometry("1180x760")
         self.minsize(1000, 650)
 
-        self.folder_var = tk.StringVar()
-        self.provider_mode_var = tk.StringVar(value="Local (Ollama /api/generate)")
-        self.endpoint_var = tk.StringVar(value="http://localhost:11434/api/generate")
-        self.model_var = tk.StringVar(value="llava")
-        self.api_key_var = tk.StringVar()
-        self.include_date_var = tk.BooleanVar(value=False)
-        self.recursive_scan_var = tk.BooleanVar(value=True)
-        self.recursive_folder_rename_var = tk.BooleanVar(value=True)
-        self.restructure_recursive_var = tk.BooleanVar(value=True)
-        self.date_format_var = tk.StringVar(value="%Y-%m-%d")
+        self.settings_path = default_settings_path()
+        loaded_settings = load_app_settings(self.settings_path)
+
+        self.folder_var = tk.StringVar(value=str(loaded_settings.get("folder", "")))
+        self.provider_mode_var = tk.StringVar(value=str(loaded_settings.get("provider_mode", DEFAULT_LOCAL_MODE)))
+        self.endpoint_var = tk.StringVar(value=str(loaded_settings.get("endpoint", DEFAULT_LOCAL_ENDPOINT)))
+        self.model_var = tk.StringVar(value=str(loaded_settings.get("model", DEFAULT_LOCAL_MODEL)))
+        self.api_key_var = tk.StringVar(value=str(loaded_settings.get("api_key", "")))
+        self.include_date_var = tk.BooleanVar(value=bool(loaded_settings.get("include_date", False)))
+        self.recursive_scan_var = tk.BooleanVar(value=bool(loaded_settings.get("recursive_scan", True)))
+        self.recursive_folder_rename_var = tk.BooleanVar(value=bool(loaded_settings.get("recursive_folder_rename", True)))
+        self.restructure_recursive_var = tk.BooleanVar(value=bool(loaded_settings.get("restructure_recursive", True)))
+        self.date_format_var = tk.StringVar(value=str(loaded_settings.get("date_format", "%Y-%m-%d")))
         # Default to human-readable names as requested: spaces + title case.
-        self.word_separator_var = tk.StringVar(value="White spaces ( )")
-        self.capitalization_var = tk.StringVar(value="Title Case")
-        self.max_filename_length_var = tk.IntVar(value=96)
-        self.max_folder_name_length_var = tk.IntVar(value=96)
-        self.include_hashtags_var = tk.BooleanVar(value=False)
-        self.hashtag_count_var = tk.IntVar(value=3)
-        self.dedupe_keep_var = tk.StringVar(value="Keep first match")
+        self.word_separator_var = tk.StringVar(value=str(loaded_settings.get("word_separator", "White spaces ( )")))
+        self.capitalization_var = tk.StringVar(value=str(loaded_settings.get("capitalization", "Title Case")))
+        self.max_filename_length_var = tk.IntVar(value=_coerce_int_setting(loaded_settings.get("max_filename_length", 96), 96))
+        self.max_folder_name_length_var = tk.IntVar(value=_coerce_int_setting(loaded_settings.get("max_folder_name_length", 96), 96))
+        self.include_hashtags_var = tk.BooleanVar(value=bool(loaded_settings.get("include_hashtags", False)))
+        self.hashtag_count_var = tk.IntVar(value=_coerce_int_setting(loaded_settings.get("hashtag_count", 3), 3))
+        self.dedupe_keep_var = tk.StringVar(value=str(loaded_settings.get("dedupe_keep", "Keep first match")))
         self.status_var = tk.StringVar(value="Choose a folder and generate AI suggestions.")
+
+        # Store per-provider endpoint/model preferences so mode switches don't erase user values.
+        self.local_endpoint = str(loaded_settings.get("local_endpoint", DEFAULT_LOCAL_ENDPOINT))
+        self.remote_endpoint = str(loaded_settings.get("remote_endpoint", DEFAULT_REMOTE_ENDPOINT))
+        self.local_model = str(loaded_settings.get("local_model", DEFAULT_LOCAL_MODEL))
+        self.remote_model = str(loaded_settings.get("remote_model", DEFAULT_REMOTE_MODEL))
 
         self.suggestions: List[FileSuggestion] = []
         self.folder_suggestions: List[FolderSuggestion] = []
@@ -978,8 +1029,13 @@ class App(tk.Tk):
         self.debug_window: Optional[tk.Toplevel] = None
         self.debug_text: Optional[tk.Text] = None
         self.ollama_models: List[str] = []
+        self._settings_ready = False
 
         self._build_ui()
+        self._register_settings_traces()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._settings_ready = True
+        self._save_settings()
         self.after(80, self._process_ui_queue)
 
     def _build_ui(self) -> None:
@@ -1226,6 +1282,77 @@ class App(tk.Tk):
 
         self._handle_mode_change()
 
+    def _capture_provider_fields_for_mode(self) -> None:
+        """Store endpoint/model values for the currently selected provider mode."""
+        if self.provider_mode_var.get().startswith("Local"):
+            self.local_endpoint = self.endpoint_var.get().strip() or DEFAULT_LOCAL_ENDPOINT
+            self.local_model = self.model_var.get().strip() or DEFAULT_LOCAL_MODEL
+        else:
+            self.remote_endpoint = self.endpoint_var.get().strip() or DEFAULT_REMOTE_ENDPOINT
+            self.remote_model = self.model_var.get().strip() or DEFAULT_REMOTE_MODEL
+
+    def _settings_snapshot(self) -> Dict[str, Any]:
+        """Collect all user-facing controls into one persisted settings object."""
+        self._capture_provider_fields_for_mode()
+        return {
+            "folder": self.folder_var.get(),
+            "provider_mode": self.provider_mode_var.get(),
+            "endpoint": self.endpoint_var.get(),
+            "model": self.model_var.get(),
+            "api_key": self.api_key_var.get(),
+            "include_date": self.include_date_var.get(),
+            "recursive_scan": self.recursive_scan_var.get(),
+            "recursive_folder_rename": self.recursive_folder_rename_var.get(),
+            "restructure_recursive": self.restructure_recursive_var.get(),
+            "date_format": self.date_format_var.get(),
+            "word_separator": self.word_separator_var.get(),
+            "capitalization": self.capitalization_var.get(),
+            "max_filename_length": self.max_filename_length_var.get(),
+            "max_folder_name_length": self.max_folder_name_length_var.get(),
+            "include_hashtags": self.include_hashtags_var.get(),
+            "hashtag_count": self.hashtag_count_var.get(),
+            "dedupe_keep": self.dedupe_keep_var.get(),
+            "local_endpoint": self.local_endpoint,
+            "remote_endpoint": self.remote_endpoint,
+            "local_model": self.local_model,
+            "remote_model": self.remote_model,
+        }
+
+    def _save_settings(self, *_: object) -> None:
+        """Persist settings after UI changes so relaunch restores the full workspace state."""
+        if not self._settings_ready:
+            return
+        save_app_settings(self._settings_snapshot(), self.settings_path)
+
+    def _register_settings_traces(self) -> None:
+        """Attach variable traces so every control change is automatically persisted."""
+        tracked_vars = [
+            self.folder_var,
+            self.provider_mode_var,
+            self.endpoint_var,
+            self.model_var,
+            self.api_key_var,
+            self.include_date_var,
+            self.recursive_scan_var,
+            self.recursive_folder_rename_var,
+            self.restructure_recursive_var,
+            self.date_format_var,
+            self.word_separator_var,
+            self.capitalization_var,
+            self.max_filename_length_var,
+            self.max_folder_name_length_var,
+            self.include_hashtags_var,
+            self.hashtag_count_var,
+            self.dedupe_keep_var,
+        ]
+        for variable in tracked_vars:
+            variable.trace_add("write", self._save_settings)
+
+    def _on_close(self) -> None:
+        """Save settings and close app."""
+        self._save_settings()
+        self.destroy()
+
     def _build_provider(self) -> AIProvider:
         """Construct provider from current UI values."""
         return AIProvider(
@@ -1295,16 +1422,19 @@ class App(tk.Tk):
 
     def _handle_mode_change(self) -> None:
         """Adjust defaults and API key availability based on selected provider."""
+        self._capture_provider_fields_for_mode()
         mode = self.provider_mode_var.get()
         if mode.startswith("Local"):
-            self.endpoint_var.set("http://localhost:11434/api/generate")
-            self.model_var.set(self.model_var.get() or "llava")
+            # Keep the user's local endpoint/model choices instead of resetting each toggle.
+            self.endpoint_var.set(self.local_endpoint or DEFAULT_LOCAL_ENDPOINT)
+            self.model_var.set(self.local_model or DEFAULT_LOCAL_MODEL)
             self.api_entry.configure(state="disabled")
             self.model_combo.configure(state="normal")
             self._start_ollama_model_refresh()
         else:
-            self.endpoint_var.set("https://api.openai.com/v1/chat/completions")
-            self.model_var.set(self.model_var.get() or "gpt-4o-mini")
+            # Keep the user's remote endpoint/model choices instead of resetting each toggle.
+            self.endpoint_var.set(self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT)
+            self.model_var.set(self.remote_model or DEFAULT_REMOTE_MODEL)
             self.api_entry.configure(state="normal")
             self.model_combo.configure(state="normal")
 
