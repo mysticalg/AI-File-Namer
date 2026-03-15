@@ -12,6 +12,7 @@ from src.ai_file_namer import (
     group_duplicate_folders,
     FilenamePreferences,
     extract_json_object,
+    format_restructure_preview_paths,
     remove_empty_folders,
     sanitize_category_path,
     sanitize_restructure_operations,
@@ -188,6 +189,24 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertEqual(len(suggestions), 2)
             self.assertEqual(suggestions[0].item_type, "folder")
             self.assertIn("Music", suggestions[0].target_relative)
+
+    def test_format_restructure_preview_paths_outputs_old_new_and_transition(self):
+        old_path, new_path, transition = format_restructure_preview_paths(
+            "Old Folder/Sub",
+            "Music/Archive/Old Folder",
+        )
+        self.assertEqual(old_path, "Old Folder/Sub")
+        self.assertEqual(new_path, "Music/Archive/Old Folder")
+        self.assertIn("→", transition)
+
+    def test_format_restructure_preview_paths_normalizes_slashes(self):
+        old_path, new_path, transition = format_restructure_preview_paths(
+            r"old\nested",
+            r"new\bucket\old",
+        )
+        self.assertEqual(old_path, "old/nested")
+        self.assertEqual(new_path, "new/bucket/old")
+        self.assertEqual(transition, "old/nested → new/bucket/old")
 
 
 if __name__ == "__main__":

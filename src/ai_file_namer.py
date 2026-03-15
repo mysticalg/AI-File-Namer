@@ -414,6 +414,14 @@ def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
     }
 
 
+def format_restructure_preview_paths(original_relative: str, target_relative: str) -> Tuple[str, str, str]:
+    """Build readable old/new preview strings for restructure rows in the results table."""
+    old_path = original_relative.replace("\\", "/").strip("/") or "."
+    new_path = target_relative.replace("\\", "/").strip("/") or "."
+    transition = f"{old_path} → {new_path}"
+    return old_path, new_path, transition
+
+
 def sanitize_restructure_operations(
     operations: Sequence[Dict[str, object]],
     root: Path,
@@ -1395,10 +1403,15 @@ class App(tk.Tk):
                 self.folder_row_paths[row_id] = folder_rec.path
             elif kind == "restructure_add":
                 move_rec: FolderStructureSuggestion = msg[1]
+                # Show both old and new structure paths for clearer pre-apply review.
+                old_path, new_path, transition = format_restructure_preview_paths(
+                    move_rec.original_relative,
+                    move_rec.target_relative,
+                )
                 row_id = self.tree.insert(
                     "",
                     tk.END,
-                    values=(move_rec.original_relative, move_rec.target_relative, move_rec.target_relative, f"{move_rec.item_type.title()} Move"),
+                    values=(old_path, new_path, transition, f"{move_rec.item_type.title()} Move"),
                 )
                 self.folder_row_paths[row_id] = move_rec.source_path
             elif kind == "status":
