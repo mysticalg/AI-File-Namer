@@ -30,6 +30,7 @@ from src.ai_file_namer import (
     load_app_settings,
     save_app_settings,
     clamp_ai_timeout_seconds,
+    build_ollama_missing_guidance,
 )
 
 
@@ -40,6 +41,15 @@ class FilenameUtilsTests(unittest.TestCase):
         self.assertEqual(clamp_ai_timeout_seconds(5), 30)
         self.assertEqual(clamp_ai_timeout_seconds("9999"), 3600)
         self.assertEqual(clamp_ai_timeout_seconds("bad"), 120)
+
+
+    def test_build_ollama_missing_guidance_when_ollama_unreachable(self):
+        message = build_ollama_missing_guidance("HTTPConnectionPool(host=localhost): Max retries exceeded")
+        self.assertIn("https://ollama.com/download", message)
+
+    def test_build_ollama_missing_guidance_for_other_errors(self):
+        message = build_ollama_missing_guidance("unexpected payload")
+        self.assertEqual(message, "Could not fetch Ollama models. You can still type a model manually.")
 
     def test_load_app_settings_returns_empty_for_missing_or_invalid_files(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

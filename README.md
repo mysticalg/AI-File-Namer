@@ -37,6 +37,8 @@ Get the latest generated installers for both platforms from GitHub Releases:
 
 ## Notes
 - The model should return concise names. The app sanitizes output for Windows-safe filenames.
+- For local mode, install Ollama: https://ollama.com/download
+- Remote mode requires an OpenAI account: https://platform.openai.com/signup
 - Keep local/remote AI endpoint available for fast response.
 
 ## CI: Build installers automatically

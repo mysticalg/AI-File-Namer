@@ -42,6 +42,8 @@ DEFAULT_OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 DEFAULT_OPENAI_OAUTH_SCOPE = "openid profile offline_access"
 DEFAULT_OPENAI_OAUTH_REDIRECT_HOST = "127.0.0.1"
 DEFAULT_OPENAI_OAUTH_REDIRECT_PORT = 8765
+OLLAMA_DOWNLOAD_URL = "https://ollama.com/download"
+OPENAI_REGISTRATION_URL = "https://platform.openai.com/signup"
 
 
 def default_settings_path() -> Path:
@@ -833,6 +835,26 @@ def fetch_ollama_model_names(generate_endpoint: str, timeout_seconds: int = 8) -
     if not isinstance(payload, dict):
         return []
     return parse_ollama_model_names(payload)
+
+
+def build_ollama_missing_guidance(error_text: str) -> str:
+    """Return actionable status guidance when local Ollama looks unavailable."""
+    normalized = error_text.lower()
+    ollama_unreachable_markers = (
+        "connection refused",
+        "failed to establish a new connection",
+        "max retries exceeded",
+        "name or service not known",
+        "nodename nor servname provided",
+        "connection aborted",
+        "winerror 10061",
+    )
+    if any(marker in normalized for marker in ollama_unreachable_markers):
+        return (
+            "Could not reach Ollama. If Ollama is not installed, download it at "
+            f"{OLLAMA_DOWNLOAD_URL} for local model usage."
+        )
+    return "Could not fetch Ollama models. You can still type a model manually."
 
 
 def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
@@ -1749,7 +1771,7 @@ class App(tk.Tk):
             models = fetch_ollama_model_names(endpoint)
         except Exception as exc:  # noqa: BLE001
             self.ui_queue.put(("debug", format_debug_event("Ollama model refresh failed", {"error": str(exc)})))
-            self.ui_queue.put(("status", "Could not fetch Ollama models. You can still type a model manually."))
+            self.ui_queue.put(("status", build_ollama_missing_guidance(str(exc))))
             return
 
         self.ui_queue.put(("ollama_models", models))
@@ -1772,7 +1794,8 @@ class App(tk.Tk):
         if self.provider_mode_var.get().startswith("Remote") and not self.api_key_var.get().strip():
             messagebox.showwarning(
                 "OpenAI OAuth required",
-                "Connect OpenAI first so the app can use your account token without an API key.",
+                "Connect OpenAI first. Remote usage requires an OpenAI account: "
+                f"{OPENAI_REGISTRATION_URL}",
             )
             return
 
