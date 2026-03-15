@@ -6,7 +6,8 @@ A Tkinter desktop app to bulk-rename images and videos using an AI model.
 - Select a folder and scan image/video files (optionally recursive through subfolders).
 - Configure AI as:
   - **Local**: Ollama `/api/generate` endpoint (example: `llava`).
-  - **Remote**: OpenAI-compatible `/v1/chat/completions` endpoint.
+  - **Remote**: OpenAI-compatible `/v1/chat/completions` endpoint using OpenAI OAuth login (no API key required).
+- Built-in **OpenAI OAuth (Authorization Code + PKCE)** button opens your browser, captures the callback locally, and stores the returned access token in app settings for future sessions.
 - For videos, extracts the **first frame** and sends it to AI.
 - Preview original filename, AI suggestion, and final filename with clickable column sorting.
 - Include optional date prefix using a custom `strftime` format.
