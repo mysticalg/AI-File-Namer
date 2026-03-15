@@ -66,6 +66,15 @@ class FolderSuggestion:
     suggested_name: str
 
 
+@dataclass
+class FolderStructureSuggestion:
+    """Stores a proposed folder move to build a cleaner directory hierarchy."""
+
+    source_path: Path
+    original_relative: str
+    target_relative: str
+
+
 def collect_media_files(folder: Path, recursive: bool) -> List[Path]:
     """Collect supported media files from a folder.
 
@@ -233,6 +242,81 @@ class AIProvider:
             )
             or "untitled_folder"
         )
+
+    def suggest_folder_structure(
+        self,
+        folder_name: str,
+        child_entries: Sequence[str],
+        preferences: FilenamePreferences,
+    ) -> str:
+        """Suggest a logical category path for a folder, like `photos/travel`."""
+        import requests
+
+        listed_items = ", ".join(child_entries[:40]) if child_entries else "empty_folder"
+        style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
+        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        prompt = (
+            "Return only a category path for organizing this folder. "
+            "Use 1 to 3 path segments separated by '/'. "
+            f"Use {style_description} and {case_description}. "
+            "No punctuation outside path separators. No explanation. "
+            f"Folder name: {folder_name}. Entries: {listed_items}"
+        )
+
+        if self.mode == "Local (Ollama /api/generate)":
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+            }
+            response = requests.post(self.endpoint, json=payload, timeout=60)
+            response.raise_for_status()
+            content = response.json().get("response", "")
+        else:
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 40,
+            }
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            choices = response.json().get("choices", [])
+            content = choices[0]["message"].get("content", "") if choices else ""
+
+        return sanitize_category_path(
+            raw=content,
+            separator=preferences.separator,
+            capitalization=preferences.capitalization,
+            max_segment_length=preferences.max_folder_name_length,
+            max_depth=3,
+        )
+
+
+def sanitize_category_path(
+    raw: str,
+    separator: str,
+    capitalization: str,
+    max_segment_length: int,
+    max_depth: int = 3,
+) -> str:
+    """Normalize model output into a safe, shallow folder category path."""
+    parts = re.split(r"[\\/>|]+", raw)
+    cleaned_parts: List[str] = []
+    for part in parts:
+        cleaned = sanitize_filename_stem(
+            part,
+            separator=separator,
+            capitalization=capitalization,
+            max_length=max_segment_length,
+        )
+        if cleaned:
+            cleaned_parts.append(cleaned)
+        if len(cleaned_parts) >= max(1, max_depth):
+            break
+    return "/".join(cleaned_parts)
 
 
 def sanitize_filename_stem(
@@ -430,6 +514,7 @@ class App(tk.Tk):
         self.include_date_var = tk.BooleanVar(value=False)
         self.recursive_scan_var = tk.BooleanVar(value=True)
         self.recursive_folder_rename_var = tk.BooleanVar(value=True)
+        self.restructure_recursive_var = tk.BooleanVar(value=True)
         self.date_format_var = tk.StringVar(value="%Y-%m-%d")
         self.word_separator_var = tk.StringVar(value="Underscores (_)")
         self.capitalization_var = tk.StringVar(value="lowercase")
@@ -442,6 +527,7 @@ class App(tk.Tk):
 
         self.suggestions: List[FileSuggestion] = []
         self.folder_suggestions: List[FolderSuggestion] = []
+        self.folder_structure_suggestions: List[FolderStructureSuggestion] = []
         self.duplicate_file_groups: List[List[Path]] = []
         self.duplicate_folder_groups: List[List[Path]] = []
         self.rename_history: List[Tuple[Path, Path]] = []
@@ -580,6 +666,29 @@ class App(tk.Tk):
         )
         ttk.Button(folder_row, text="✅ Apply Folder Renames", command=self._apply_folder_renames).pack(side=tk.LEFT)
 
+        restructure_row = ttk.Frame(top)
+        restructure_row.grid(row=3, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
+        ttk.Checkbutton(
+            restructure_row,
+            text="Include subfolders in restructure",
+            variable=self.restructure_recursive_var,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            restructure_row,
+            text="🧭 Suggest Folder Restructure",
+            command=self._start_folder_restructure_suggestions,
+        ).pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Button(
+            restructure_row,
+            text="✅ Apply Folder Restructure",
+            command=self._apply_folder_restructure,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            restructure_row,
+            text="Uses AI to group existing folders into a cleaner hierarchy.",
+            foreground="#666",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
         dedupe_row = ttk.Frame(top)
         dedupe_row.grid(row=6, column=2, columnspan=3, sticky="w", padx=8, pady=(8, 0))
         ttk.Label(dedupe_row, text="🧹 Deduplicate:").pack(side=tk.LEFT)
@@ -597,9 +706,9 @@ class App(tk.Tk):
 
         ttk.Label(
             top,
-            text="Tip: Use folder suggestions to build a hierarchy like music_files > midi_files > classical > js_bach.",
+            text="Tip: Use folder suggestions for names, then use restructure to consolidate messy folder trees.",
             foreground="#666",
-        ).grid(row=3, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
+        ).grid(row=7, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
 
         top.columnconfigure(1, weight=1)
 
@@ -675,6 +784,7 @@ class App(tk.Tk):
 
         self.tree.delete(*self.tree.get_children())
         self.suggestions.clear()
+        self.folder_structure_suggestions.clear()
         self.status_var.set("Collecting files and requesting AI suggestions...")
 
         worker = threading.Thread(
@@ -768,6 +878,7 @@ class App(tk.Tk):
             return
 
         self.folder_suggestions.clear()
+        self.folder_structure_suggestions.clear()
         self.folder_row_paths.clear()
         # Clear and repurpose the output grid so users can review folder names before applying.
         self.tree.delete(*self.tree.get_children())
@@ -849,6 +960,108 @@ class App(tk.Tk):
         self.folder_rename_history = history
         self.folder_suggestions.clear()
         self.status_var.set(f"Folder rename complete: {len(history)} folder(s) renamed.")
+
+    def _start_folder_restructure_suggestions(self) -> None:
+        """Build AI suggestions for moving folders into cleaner category paths."""
+        folder = Path(self.folder_var.get()).expanduser()
+        if not folder.exists() or not folder.is_dir():
+            messagebox.showerror("Invalid folder", "Please choose a valid folder.")
+            return
+
+        self.folder_structure_suggestions.clear()
+        self.folder_row_paths.clear()
+        self.tree.delete(*self.tree.get_children())
+        self.status_var.set("Analyzing folder hierarchy and proposing a logical restructure...")
+
+        worker = threading.Thread(
+            target=self._folder_restructure_worker,
+            args=(folder, self.restructure_recursive_var.get(), self._current_preferences()),
+            daemon=True,
+        )
+        worker.start()
+
+    def _folder_restructure_worker(self, folder: Path, recursive_folders: bool, preferences: FilenamePreferences) -> None:
+        """Generate suggested destination category paths for subfolders."""
+        candidate_folders = collect_subfolders(folder, recursive_folders)
+        if not candidate_folders:
+            self.ui_queue.put(("status", "No subfolders found to restructure."))
+            return
+
+        provider = self._build_provider()
+        for idx, subfolder in enumerate(candidate_folders, start=1):
+            try:
+                child_entries = sorted([child.name for child in subfolder.iterdir()])
+                target_relative = provider.suggest_folder_structure(subfolder.name, child_entries, preferences)
+                if not target_relative:
+                    continue
+
+                proposal = FolderStructureSuggestion(
+                    source_path=subfolder,
+                    original_relative=str(subfolder.relative_to(folder)),
+                    target_relative=f"{target_relative}/{subfolder.name}",
+                )
+                self.folder_structure_suggestions.append(proposal)
+                self.ui_queue.put(("restructure_add", proposal))
+                self.ui_queue.put(
+                    ("status", f"Restructure suggestion {idx}/{len(candidate_folders)}: {proposal.original_relative}"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.ui_queue.put(("status", f"Restructure suggestion failed for {subfolder.name}: {exc}"))
+
+        self.ui_queue.put(
+            ("status", f"Restructure suggestions ready: {len(self.folder_structure_suggestions)} folder(s)."),
+        )
+
+    def _apply_folder_restructure(self) -> None:
+        """Apply proposed folder moves to create a cleaner category hierarchy."""
+        if not self.folder_structure_suggestions:
+            messagebox.showinfo("No restructure suggestions", "Run 'Suggest Folder Restructure' first.")
+            return
+
+        if not messagebox.askyesno(
+            "Confirm folder restructure",
+            f"Move {len(self.folder_structure_suggestions)} folder(s) into AI-suggested categories?",
+        ):
+            return
+
+        root = Path(self.folder_var.get()).expanduser()
+        moved_count = 0
+        skipped_count = 0
+        for proposal in self.folder_structure_suggestions:
+            src = proposal.source_path
+            if not src.exists():
+                skipped_count += 1
+                continue
+
+            relative_parts = [part for part in Path(proposal.target_relative).parts if part not in (".", "..")]
+            if not relative_parts:
+                skipped_count += 1
+                continue
+
+            destination = root.joinpath(*relative_parts)
+            if destination == src:
+                continue
+            if str(destination).startswith(str(src) + os.sep):
+                skipped_count += 1
+                continue
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            candidate_destination = destination
+            counter = 1
+            while candidate_destination.exists() and candidate_destination != src:
+                candidate_destination = destination.with_name(f"{destination.name}_{counter}")
+                counter += 1
+
+            try:
+                src.rename(candidate_destination)
+                moved_count += 1
+            except OSError:
+                skipped_count += 1
+
+        self.folder_structure_suggestions.clear()
+        self.status_var.set(
+            f"Folder restructure complete: moved {moved_count} folder(s), skipped {skipped_count}."
+        )
 
     def _start_duplicate_scan(self) -> None:
         """Start duplicate scan in a worker to keep the UI responsive."""
@@ -1004,6 +1217,14 @@ class App(tk.Tk):
                 )
                 # Keep exact paths for right-click Explorer actions.
                 self.folder_row_paths[row_id] = folder_rec.path
+            elif kind == "restructure_add":
+                move_rec: FolderStructureSuggestion = msg[1]
+                row_id = self.tree.insert(
+                    "",
+                    tk.END,
+                    values=(move_rec.original_relative, move_rec.target_relative, move_rec.target_relative, "Move Ready"),
+                )
+                self.folder_row_paths[row_id] = move_rec.source_path
             elif kind == "status":
                 self.status_var.set(msg[1])
 

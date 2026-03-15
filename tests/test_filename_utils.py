@@ -11,6 +11,7 @@ from src.ai_file_namer import (
     group_duplicate_files,
     group_duplicate_folders,
     remove_empty_folders,
+    sanitize_category_path,
     sanitize_filename_stem,
 )
 
@@ -131,6 +132,26 @@ class FilenameUtilsTests(unittest.TestCase):
             groups = group_duplicate_folders([f1, f2])
             self.assertEqual(len(groups), 1)
             self.assertEqual({item.name for item in groups[0]}, {"one", "two"})
+
+    def test_sanitize_category_path_limits_depth_and_cleans_segments(self):
+        path = sanitize_category_path(
+            raw="Music > Classical / Bach / Organ / Extra",
+            separator="_",
+            capitalization="lower",
+            max_segment_length=12,
+            max_depth=3,
+        )
+        self.assertEqual(path, "music/classical/bach")
+
+    def test_sanitize_category_path_supports_title_case_with_spaces(self):
+        path = sanitize_category_path(
+            raw="personal photos/travel shots",
+            separator=" ",
+            capitalization="title",
+            max_segment_length=20,
+            max_depth=3,
+        )
+        self.assertEqual(path, "Personal Photos/Travel Shots")
 
 
 if __name__ == "__main__":
