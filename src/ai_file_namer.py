@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.server
 import json
 import os
 import queue
 import re
+import secrets
 import subprocess
 import sys
 import shutil
 import threading
+import urllib.parse
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +36,12 @@ DEFAULT_REMOTE_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 DEFAULT_LOCAL_MODEL = "llava"
 DEFAULT_REMOTE_MODEL = "gpt-4o-mini"
 DEFAULT_AI_TIMEOUT_SECONDS = 120
+DEFAULT_OPENAI_OAUTH_CLIENT_ID = "change-me-openai-oauth-client-id"
+DEFAULT_OPENAI_OAUTH_AUTH_URL = "https://auth.openai.com/oauth/authorize"
+DEFAULT_OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+DEFAULT_OPENAI_OAUTH_SCOPE = "openid profile offline_access"
+DEFAULT_OPENAI_OAUTH_REDIRECT_HOST = "127.0.0.1"
+DEFAULT_OPENAI_OAUTH_REDIRECT_PORT = 8765
 
 
 def default_settings_path() -> Path:
@@ -73,6 +83,113 @@ def clamp_ai_timeout_seconds(value: Any) -> int:
     """Clamp timeout settings to a safe, user-adjustable range."""
     parsed = _coerce_int_setting(value, DEFAULT_AI_TIMEOUT_SECONDS)
     return max(30, min(parsed, 3600))
+
+
+def _pkce_code_challenge(verifier: str) -> str:
+    """Build an RFC-7636 PKCE code challenge from a verifier string."""
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+    """Capture one OAuth callback and pass the query parameters to the flow owner."""
+
+    server_version = "AIOAuthCallback/1.0"
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(parsed.query)
+        flat_query = {key: values[0] for key, values in query.items() if values}
+        self.server.auth_result = flat_query  # type: ignore[attr-defined]
+
+        if "error" in flat_query:
+            page = "<h2>OpenAI authorization failed.</h2><p>You can close this window.</p>"
+        else:
+            page = "<h2>OpenAI connected successfully.</h2><p>You can return to AI File Namer.</p>"
+
+        body = f"<html><body style='font-family:Segoe UI,Arial'>{page}</body></html>".encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+        """Silence local callback HTTP logs to keep stdout clean."""
+        return
+
+
+class OpenAIOAuthClient:
+    """Handle OpenAI OAuth login and token exchange for desktop app sessions."""
+
+    def __init__(self, client_id: str, auth_url: str, token_url: str, scope: str):
+        self.client_id = client_id.strip()
+        self.auth_url = auth_url.strip()
+        self.token_url = token_url.strip()
+        self.scope = scope.strip()
+
+    def authorize(self, timeout_seconds: int = 180) -> Dict[str, Any]:
+        """Run OAuth Authorization Code + PKCE flow and return token payload."""
+        import requests
+
+        if not self.client_id or self.client_id == DEFAULT_OPENAI_OAUTH_CLIENT_ID:
+            raise ValueError("Set your OpenAI OAuth Client ID before connecting.")
+
+        redirect_uri = (
+            f"http://{DEFAULT_OPENAI_OAUTH_REDIRECT_HOST}:{DEFAULT_OPENAI_OAUTH_REDIRECT_PORT}/oauth/callback"
+        )
+        verifier = secrets.token_urlsafe(64)
+        state = secrets.token_urlsafe(24)
+        challenge = _pkce_code_challenge(verifier)
+
+        with http.server.ThreadingHTTPServer(
+            (DEFAULT_OPENAI_OAUTH_REDIRECT_HOST, DEFAULT_OPENAI_OAUTH_REDIRECT_PORT),
+            _OAuthCallbackHandler,
+        ) as callback_server:
+            callback_server.timeout = timeout_seconds
+            callback_server.auth_result = None  # type: ignore[attr-defined]
+
+            query = urllib.parse.urlencode(
+                {
+                    "client_id": self.client_id,
+                    "response_type": "code",
+                    "redirect_uri": redirect_uri,
+                    "scope": self.scope,
+                    "state": state,
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                }
+            )
+            auth_link = f"{self.auth_url}?{query}"
+            webbrowser.open(auth_link, new=1)
+            callback_server.handle_request()
+            result = getattr(callback_server, "auth_result", None)
+
+        if not isinstance(result, dict):
+            raise RuntimeError("Timed out waiting for OpenAI authorization callback.")
+        if result.get("state") != state:
+            raise RuntimeError("OAuth state mismatch detected. Please try again.")
+        if "error" in result:
+            description = result.get("error_description", result.get("error", "unknown_error"))
+            raise RuntimeError(f"OpenAI OAuth error: {description}")
+
+        auth_code = str(result.get("code", "")).strip()
+        if not auth_code:
+            raise RuntimeError("Authorization succeeded but no authorization code was returned.")
+
+        token_payload = {
+            "grant_type": "authorization_code",
+            "client_id": self.client_id,
+            "code": auth_code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+        }
+        token_response = requests.post(self.token_url, data=token_payload, timeout=30)
+        token_response.raise_for_status()
+        parsed = token_response.json()
+        if not isinstance(parsed, dict) or not parsed.get("access_token"):
+            raise RuntimeError("Token response did not contain an access token.")
+        return parsed
 
 
 @dataclass
@@ -1048,6 +1165,10 @@ class App(tk.Tk):
         self.endpoint_var = tk.StringVar(value=str(loaded_settings.get("endpoint", DEFAULT_LOCAL_ENDPOINT)))
         self.model_var = tk.StringVar(value=str(loaded_settings.get("model", DEFAULT_LOCAL_MODEL)))
         self.api_key_var = tk.StringVar(value=str(loaded_settings.get("api_key", "")))
+        self.openai_client_id_var = tk.StringVar(value=str(loaded_settings.get("openai_client_id", DEFAULT_OPENAI_OAUTH_CLIENT_ID)))
+        self.openai_auth_url_var = tk.StringVar(value=str(loaded_settings.get("openai_auth_url", DEFAULT_OPENAI_OAUTH_AUTH_URL)))
+        self.openai_token_url_var = tk.StringVar(value=str(loaded_settings.get("openai_token_url", DEFAULT_OPENAI_OAUTH_TOKEN_URL)))
+        self.openai_scope_var = tk.StringVar(value=str(loaded_settings.get("openai_scope", DEFAULT_OPENAI_OAUTH_SCOPE)))
         self.include_date_var = tk.BooleanVar(value=bool(loaded_settings.get("include_date", False)))
         self.recursive_scan_var = tk.BooleanVar(value=bool(loaded_settings.get("recursive_scan", True)))
         self.recursive_folder_rename_var = tk.BooleanVar(value=bool(loaded_settings.get("recursive_folder_rename", True)))
@@ -1084,6 +1205,7 @@ class App(tk.Tk):
         self.debug_window: Optional[tk.Toplevel] = None
         self.debug_text: Optional[tk.Text] = None
         self.ollama_models: List[str] = []
+        self.oauth_in_progress = False
         self._settings_ready = False
 
         self._build_ui()
@@ -1152,11 +1274,25 @@ class App(tk.Tk):
             command=self._start_ollama_model_refresh,
         ).grid(row=0, column=1, padx=(6, 0))
 
-        ttk.Label(ai_frame, text="API Key").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
-        self.api_entry = ttk.Entry(ai_frame, textvariable=self.api_key_var, show="*")
-        self.api_entry.grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        ttk.Label(ai_frame, text="OpenAI OAuth Client ID").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Entry(ai_frame, textvariable=self.openai_client_id_var).grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
 
-        ttk.Label(ai_frame, text="⏱️ AI timeout (sec)").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        oauth_controls = ttk.Frame(ai_frame)
+        oauth_controls.grid(row=4, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.oauth_connect_button = ttk.Button(oauth_controls, text="🔐 Connect OpenAI", command=self._start_openai_oauth_login)
+        self.oauth_connect_button.pack(side=tk.LEFT)
+        self.oauth_disconnect_button = ttk.Button(
+            oauth_controls,
+            text="🧹 Forget Token",
+            command=self._clear_openai_token,
+        )
+        self.oauth_disconnect_button.pack(side=tk.LEFT, padx=(6, 0))
+
+        ttk.Label(ai_frame, text="Token Status").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        self.oauth_status_label = ttk.Label(ai_frame, text="Not connected", foreground="#666")
+        self.oauth_status_label.grid(row=5, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
+
+        ttk.Label(ai_frame, text="⏱️ AI timeout (sec)").grid(row=6, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Spinbox(
             ai_frame,
             from_=30,
@@ -1164,13 +1300,13 @@ class App(tk.Tk):
             increment=30,
             textvariable=self.ai_timeout_seconds_var,
             width=10,
-        ).grid(row=4, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        ).grid(row=6, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
 
         ttk.Label(
             ai_frame,
-            text="Tip: Default is 120s. Increase this for slower models or large media inputs.",
+            text="Tip: Use OAuth Connect for OpenAI remote mode. Tokens are saved locally for reuse.",
             foreground="#666",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
 
         # 3) Naming section: filename/folder conventions together for predictability.
         naming_frame = ttk.LabelFrame(top, text="✍️ Naming Rules")
@@ -1346,6 +1482,7 @@ class App(tk.Tk):
         ttk.Label(self, textvariable=self.status_var, padding=(12, 0, 12, 12), foreground="#005a9c").pack(anchor="w")
 
         self._handle_mode_change()
+        self._refresh_oauth_status_label()
 
     def _capture_provider_fields_for_mode(self) -> None:
         """Store endpoint/model values for the currently selected provider mode."""
@@ -1365,6 +1502,10 @@ class App(tk.Tk):
             "endpoint": self.endpoint_var.get(),
             "model": self.model_var.get(),
             "api_key": self.api_key_var.get(),
+            "openai_client_id": self.openai_client_id_var.get(),
+            "openai_auth_url": self.openai_auth_url_var.get(),
+            "openai_token_url": self.openai_token_url_var.get(),
+            "openai_scope": self.openai_scope_var.get(),
             "include_date": self.include_date_var.get(),
             "recursive_scan": self.recursive_scan_var.get(),
             "recursive_folder_rename": self.recursive_folder_rename_var.get(),
@@ -1398,6 +1539,10 @@ class App(tk.Tk):
             self.endpoint_var,
             self.model_var,
             self.api_key_var,
+            self.openai_client_id_var,
+            self.openai_auth_url_var,
+            self.openai_token_url_var,
+            self.openai_scope_var,
             self.include_date_var,
             self.recursive_scan_var,
             self.recursive_folder_rename_var,
@@ -1434,6 +1579,54 @@ class App(tk.Tk):
     def _queue_debug_event(self, message: str) -> None:
         """Queue debug events from worker threads so UI updates stay thread-safe."""
         self.ui_queue.put(("debug", message))
+
+    def _refresh_oauth_status_label(self) -> None:
+        """Show whether a reusable OpenAI OAuth token is available in app settings."""
+        token = self.api_key_var.get().strip()
+        if token:
+            prefix = token[:8]
+            self.oauth_status_label.configure(text=f"Connected (token starts with: {prefix}…)", foreground="#0a6f2b")
+        else:
+            self.oauth_status_label.configure(text="Not connected", foreground="#666")
+
+    def _clear_openai_token(self) -> None:
+        """Forget persisted OAuth token so remote requests no longer authenticate."""
+        self.api_key_var.set("")
+        self.status_var.set("Cleared stored OpenAI OAuth token.")
+        self._refresh_oauth_status_label()
+
+    def _start_openai_oauth_login(self) -> None:
+        """Launch the OAuth flow in a worker thread so the Tkinter UI stays responsive."""
+        if self.oauth_in_progress:
+            return
+        if not self.provider_mode_var.get().startswith("Remote"):
+            self.status_var.set("Switch to Remote mode to connect OpenAI OAuth.")
+            return
+
+        self.oauth_in_progress = True
+        self.oauth_connect_button.configure(state="disabled")
+        self.status_var.set("Opening browser for OpenAI OAuth login…")
+        worker = threading.Thread(target=self._openai_oauth_login_worker, daemon=True)
+        worker.start()
+
+    def _openai_oauth_login_worker(self) -> None:
+        """Execute OAuth login and post result back to the main thread queue."""
+        try:
+            oauth_client = OpenAIOAuthClient(
+                client_id=self.openai_client_id_var.get(),
+                auth_url=self.openai_auth_url_var.get(),
+                token_url=self.openai_token_url_var.get(),
+                scope=self.openai_scope_var.get(),
+            )
+            token_payload = oauth_client.authorize()
+            access_token = str(token_payload.get("access_token", "")).strip()
+            if not access_token:
+                raise RuntimeError("OpenAI token response did not include an access token.")
+            self.ui_queue.put(("oauth_connected", access_token))
+        except Exception as exc:  # noqa: BLE001
+            self.ui_queue.put(("oauth_error", str(exc)))
+        finally:
+            self.ui_queue.put(("oauth_done", None))
 
     def _open_debug_window(self) -> None:
         """Open a live debug window showing AI request/response payload summaries."""
@@ -1489,22 +1682,26 @@ class App(tk.Tk):
             self.debug_text.see(tk.END)
 
     def _handle_mode_change(self) -> None:
-        """Adjust defaults and API key availability based on selected provider."""
+        """Adjust defaults and OAuth controls based on selected provider mode."""
         self._capture_provider_fields_for_mode()
         mode = self.provider_mode_var.get()
         if mode.startswith("Local"):
             # Keep the user's local endpoint/model choices instead of resetting each toggle.
             self.endpoint_var.set(self.local_endpoint or DEFAULT_LOCAL_ENDPOINT)
             self.model_var.set(self.local_model or DEFAULT_LOCAL_MODEL)
-            self.api_entry.configure(state="disabled")
             self.model_combo.configure(state="normal")
+            self.oauth_connect_button.configure(state="disabled")
+            self.oauth_disconnect_button.configure(state="disabled")
             self._start_ollama_model_refresh()
         else:
             # Keep the user's remote endpoint/model choices instead of resetting each toggle.
             self.endpoint_var.set(self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT)
             self.model_var.set(self.remote_model or DEFAULT_REMOTE_MODEL)
-            self.api_entry.configure(state="normal")
             self.model_combo.configure(state="normal")
+            self.oauth_connect_button.configure(state="normal" if not self.oauth_in_progress else "disabled")
+            self.oauth_disconnect_button.configure(state="normal")
+
+        self._refresh_oauth_status_label()
 
     def _start_ollama_model_refresh(self) -> None:
         """Load available Ollama models into the model dropdown without blocking the UI."""
@@ -1543,6 +1740,13 @@ class App(tk.Tk):
         folder = Path(self.folder_var.get()).expanduser()
         if not folder.exists() or not folder.is_dir():
             messagebox.showerror("Invalid folder", "Please choose a valid folder.")
+            return
+
+        if self.provider_mode_var.get().startswith("Remote") and not self.api_key_var.get().strip():
+            messagebox.showwarning(
+                "OpenAI OAuth required",
+                "Connect OpenAI first so the app can use your account token without an API key.",
+            )
             return
 
         self.tree.delete(*self.tree.get_children())
@@ -2080,6 +2284,16 @@ class App(tk.Tk):
                     self.model_var.set(models[0])
             elif kind == "debug":
                 self._append_debug_output(msg[1])
+            elif kind == "oauth_connected":
+                token = str(msg[1])
+                self.api_key_var.set(token)
+                self._refresh_oauth_status_label()
+                self.status_var.set("OpenAI OAuth connected. Token saved for future runs.")
+            elif kind == "oauth_error":
+                self.status_var.set(f"OpenAI OAuth failed: {msg[1]}")
+            elif kind == "oauth_done":
+                self.oauth_in_progress = False
+                self._handle_mode_change()
 
         self.after(80, self._process_ui_queue)
 
