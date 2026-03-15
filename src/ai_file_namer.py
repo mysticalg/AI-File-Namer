@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import queue
 import re
+import shutil
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,6 +29,8 @@ class FilenamePreferences:
     separator: str
     capitalization: str
     max_filename_length: int
+    include_hashtags: bool
+    hashtag_count: int
 
 
 @dataclass
@@ -104,12 +108,18 @@ class AIProvider:
 
         style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
         case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        hashtag_description = (
+            f" Append up to {preferences.hashtag_count} short hashtags at the end."
+            if preferences.include_hashtags and preferences.hashtag_count > 0
+            else ""
+        )
         prompt = (
             "Return only a filename stem for this media. "
             f"Use {style_description} and {case_description}. "
             "No extension, no punctuation, no markdown, no explanation. "
             "Use descriptive wording and try to use the full allowed length. "
             f"Target stem length: {target_stem_length} characters."
+            f"{hashtag_description}"
         )
 
         if self.mode == "Local (Ollama /api/generate)":
@@ -150,12 +160,22 @@ class AIProvider:
             choices = response.json().get("choices", [])
             content = choices[0]["message"]["content"] if choices else ""
 
-        return sanitize_filename_stem(
+        stem = sanitize_filename_stem(
             content,
             separator=preferences.separator,
             capitalization=preferences.capitalization,
             max_length=target_stem_length,
         ) or "untitled_media"
+
+        if preferences.include_hashtags and preferences.hashtag_count > 0:
+            stem = append_hashtags(
+                stem=stem,
+                separator=preferences.separator,
+                hashtag_count=preferences.hashtag_count,
+                max_length=target_stem_length,
+            )
+
+        return stem
 
     def suggest_folder_name(self, folder_name: str, child_entries: Sequence[str]) -> str:
         """Suggest a folder name using the folder's visible content labels."""
@@ -237,6 +257,83 @@ def compute_target_stem_length(
     return max(1, safe_total - overhead_length)
 
 
+def append_hashtags(stem: str, separator: str, hashtag_count: int, max_length: int) -> str:
+    """Append deduplicated hashtags derived from stem words while honoring length.
+
+    This helper keeps the app responsive by generating hashtags locally instead of
+    requiring an extra model call per file.
+    """
+    if hashtag_count <= 0:
+        return stem[:max_length]
+
+    words = [token.lower() for token in re.split(r"[^a-zA-Z0-9]+", stem) if len(token) >= 3]
+    dedup_words: List[str] = []
+    for word in words:
+        if word not in dedup_words:
+            dedup_words.append(word)
+
+    tags = [f"#{word}" for word in dedup_words[:hashtag_count]]
+    if not tags:
+        return stem[:max_length]
+
+    base = stem.strip()
+    if not base:
+        base = "untitled"
+
+    # Keep trimming tags from the right until the full filename stem fits.
+    while tags:
+        combined = f"{base}{separator}{separator.join(tags)}"
+        if len(combined) <= max_length:
+            return combined
+        tags.pop()
+
+    return base[:max_length]
+
+
+def file_sha256(path: Path) -> str:
+    """Calculate SHA256 digest for duplicate detection."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def group_duplicate_files(files: Sequence[Path]) -> List[List[Path]]:
+    """Group duplicate files by content hash."""
+    buckets: Dict[str, List[Path]] = {}
+    for file_path in files:
+        try:
+            digest = file_sha256(file_path)
+            buckets.setdefault(digest, []).append(file_path)
+        except OSError:
+            continue
+    return [sorted(group) for group in buckets.values() if len(group) > 1]
+
+
+def folder_signature(folder: Path) -> str:
+    """Build a deterministic folder signature from files and contents."""
+    digest = hashlib.sha256()
+    if not folder.exists() or not folder.is_dir():
+        return ""
+
+    for file_path in sorted([p for p in folder.glob("**/*") if p.is_file()]):
+        relative = str(file_path.relative_to(folder)).replace("\\", "/")
+        digest.update(relative.encode("utf-8"))
+        digest.update(file_sha256(file_path).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def group_duplicate_folders(folders: Sequence[Path]) -> List[List[Path]]:
+    """Group duplicate folders by recursive content signature."""
+    buckets: Dict[str, List[Path]] = {}
+    for folder in folders:
+        signature = folder_signature(folder)
+        if signature:
+            buckets.setdefault(signature, []).append(folder)
+    return [sorted(group) for group in buckets.values() if len(group) > 1]
+
+
 def format_date(pattern: str) -> str:
     """Return formatted date string (defaults to YYYY-MM-DD on invalid pattern)."""
     try:
@@ -296,10 +393,15 @@ class App(tk.Tk):
         self.word_separator_var = tk.StringVar(value="Underscores (_)")
         self.capitalization_var = tk.StringVar(value="lowercase")
         self.max_filename_length_var = tk.IntVar(value=96)
+        self.include_hashtags_var = tk.BooleanVar(value=False)
+        self.hashtag_count_var = tk.IntVar(value=3)
+        self.dedupe_keep_var = tk.StringVar(value="Keep first match")
         self.status_var = tk.StringVar(value="Choose a folder and generate AI suggestions.")
 
         self.suggestions: List[FileSuggestion] = []
         self.folder_suggestions: List[FolderSuggestion] = []
+        self.duplicate_file_groups: List[List[Path]] = []
+        self.duplicate_folder_groups: List[List[Path]] = []
         self.rename_history: List[Tuple[Path, Path]] = []
         self.folder_rename_history: List[Tuple[Path, Path]] = []
         self.ui_queue: queue.Queue = queue.Queue()
@@ -392,6 +494,21 @@ class App(tk.Tk):
         ).pack(side=tk.LEFT, padx=(6, 4))
         ttk.Label(naming_row, text="(includes date + extension)", foreground="#666").pack(side=tk.LEFT)
 
+        hashtag_row = ttk.Frame(top)
+        hashtag_row.grid(row=5, column=2, columnspan=3, sticky="w", padx=8, pady=(8, 0))
+        ttk.Checkbutton(
+            hashtag_row,
+            text="#️⃣ Include hashtags",
+            variable=self.include_hashtags_var,
+        ).pack(side=tk.LEFT)
+        ttk.Label(hashtag_row, text="Count:").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Spinbox(hashtag_row, from_=1, to=10, width=4, textvariable=self.hashtag_count_var).pack(side=tk.LEFT)
+        ttk.Label(
+            hashtag_row,
+            text="AI and local post-processing keep tags inside your character limit.",
+            foreground="#666",
+        ).pack(side=tk.LEFT, padx=8)
+
         folder_row = ttk.Frame(top)
         folder_row.grid(row=2, column=2, columnspan=3, sticky="w", padx=8)
         ttk.Checkbutton(
@@ -403,6 +520,20 @@ class App(tk.Tk):
             side=tk.LEFT, padx=(10, 4)
         )
         ttk.Button(folder_row, text="✅ Apply Folder Renames", command=self._apply_folder_renames).pack(side=tk.LEFT)
+
+        dedupe_row = ttk.Frame(top)
+        dedupe_row.grid(row=6, column=2, columnspan=3, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(dedupe_row, text="🧹 Deduplicate:").pack(side=tk.LEFT)
+        ttk.Combobox(
+            dedupe_row,
+            width=16,
+            textvariable=self.dedupe_keep_var,
+            values=["Keep first match", "Keep last match"],
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=(8, 8))
+        ttk.Button(dedupe_row, text="🔁 Find Duplicates", command=self._start_duplicate_scan).pack(side=tk.LEFT)
+        ttk.Button(dedupe_row, text="✅ Apply Deduplication", command=self._apply_deduplication).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(dedupe_row, text="(files + folders)", foreground="#666").pack(side=tk.LEFT, padx=8)
 
         ttk.Label(
             top,
@@ -501,10 +632,17 @@ class App(tk.Tk):
         except (TypeError, tk.TclError, ValueError):
             chosen_length = 96
         max_length = max(1, min(chosen_length, MAX_WINDOWS_FILENAME_LENGTH))
+        try:
+            hashtag_raw = int(self.hashtag_count_var.get())
+        except (TypeError, tk.TclError, ValueError):
+            hashtag_raw = 3
+        hashtag_count = max(1, min(hashtag_raw, 10))
         return FilenamePreferences(
             separator=separator,
             capitalization=capitalization,
             max_filename_length=max_length,
+            include_hashtags=self.include_hashtags_var.get(),
+            hashtag_count=hashtag_count,
         )
 
     def _scan_worker(
@@ -628,6 +766,91 @@ class App(tk.Tk):
         self.folder_rename_history = history
         self.folder_suggestions.clear()
         self.status_var.set(f"Folder rename complete: {len(history)} folder(s) renamed.")
+
+    def _start_duplicate_scan(self) -> None:
+        """Start duplicate scan in a worker to keep the UI responsive."""
+        folder = Path(self.folder_var.get()).expanduser()
+        if not folder.exists() or not folder.is_dir():
+            messagebox.showerror("Invalid folder", "Please choose a valid folder.")
+            return
+
+        self.status_var.set("Scanning for duplicate files and folders...")
+        worker = threading.Thread(
+            target=self._duplicate_scan_worker,
+            args=(folder, self.recursive_scan_var.get()),
+            daemon=True,
+        )
+        worker.start()
+
+    def _duplicate_scan_worker(self, folder: Path, recursive_scan: bool) -> None:
+        files = collect_media_files(folder, recursive_scan)
+        file_groups = group_duplicate_files(files)
+
+        scan_folders = collect_subfolders(folder, recursive=True) if recursive_scan else collect_subfolders(folder, recursive=False)
+        folder_groups = group_duplicate_folders(scan_folders)
+
+        self.duplicate_file_groups = file_groups
+        self.duplicate_folder_groups = folder_groups
+        self.ui_queue.put(
+            (
+                "status",
+                f"Duplicate scan complete: {len(file_groups)} file group(s), {len(folder_groups)} folder group(s).",
+            )
+        )
+
+    def _apply_deduplication(self) -> None:
+        """Apply deduplication by keeping first/last item in each duplicate group."""
+        if not self.duplicate_file_groups and not self.duplicate_folder_groups:
+            messagebox.showinfo("No duplicate data", "Run 'Find Duplicates' first.")
+            return
+
+        if not messagebox.askyesno(
+            "Confirm deduplication",
+            "This will remove duplicate files and merge duplicate folders. Continue?",
+        ):
+            return
+
+        keep_last = self.dedupe_keep_var.get() == "Keep last match"
+        file_removed = 0
+        folder_removed = 0
+
+        for group in self.duplicate_file_groups:
+            ordered = sorted(group)
+            keeper = ordered[-1] if keep_last else ordered[0]
+            for duplicate in ordered:
+                if duplicate == keeper or not duplicate.exists():
+                    continue
+                try:
+                    duplicate.unlink()
+                    file_removed += 1
+                except OSError:
+                    continue
+
+        for group in self.duplicate_folder_groups:
+            ordered = sorted(group)
+            keeper = ordered[-1] if keep_last else ordered[0]
+            for duplicate in ordered:
+                if duplicate == keeper or not duplicate.exists() or not keeper.exists():
+                    continue
+
+                # Merge unique children into keeper, then delete duplicate folder.
+                for child in sorted(duplicate.iterdir()):
+                    target = keeper / child.name
+                    if target.exists():
+                        continue
+                    try:
+                        shutil.move(str(child), str(target))
+                    except OSError:
+                        continue
+                try:
+                    duplicate.rmdir()
+                    folder_removed += 1
+                except OSError:
+                    continue
+
+        self.status_var.set(
+            f"Deduplication complete: removed {file_removed} duplicate files and {folder_removed} duplicate folders."
+        )
 
     def _process_ui_queue(self) -> None:
         while True:
