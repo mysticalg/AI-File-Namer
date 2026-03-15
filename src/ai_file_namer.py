@@ -446,6 +446,8 @@ class AIProvider:
         prompt = (
             "You are organizing a messy folder tree. "
             "Primary goal: consolidate and simplify the tree so it has fewer, clearer folders. "
+            "Use root context (root name, parent name, and full root path) to infer domain and naming intent. "
+            "For example, if context suggests Music/Artist/Bach, expand cryptic catalog labels into meaningful work names when confident. "
             "Return JSON only with shape: "
             "{\"operations\": [{\"type\": \"folder\", \"source\": \"relative/path\", \"destination\": \"relative/parent/path\"}], "
             "\"reorganized_structure\": [\"relative/final/folder/path\"], "
@@ -460,6 +462,8 @@ class AIProvider:
             "Do not include markdown. "
             "Every source folder should appear exactly once in operations (unless intentionally unchanged). "
             "Group semantically similar folders under shared parent categories. "
+            "When domain appears to be classical music, prefer composer/work hierarchy over opaque codes when possible (e.g., Artist > Work Group > Full Work Title). "
+            "If uncertain, keep existing names rather than inventing facts. "
             f"{extra_instruction} "
             f"Inventory: {json.dumps(inventory)}"
         )
@@ -734,6 +738,9 @@ def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
 
     return {
         "root": folder.name,
+        # Include root context so the model can infer domain (e.g., Music/Artists/Bach).
+        "root_full_path": str(folder.resolve()),
+        "root_parent_name": folder.parent.name,
         "folder_count": len(folders),
         # Full path list helps the model return one complete grouped structure in one response.
         "all_folder_paths": folder_paths[:600],

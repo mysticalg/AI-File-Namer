@@ -335,6 +335,8 @@ class FilenameUtilsTests(unittest.TestCase):
             inventory = build_folder_inventory(root, recursive=True)
 
             self.assertEqual(inventory["root"], root.name)
+            self.assertIn("root_full_path", inventory)
+            self.assertIn("root_parent_name", inventory)
             self.assertNotIn("files", inventory)
             self.assertNotIn("file_count", inventory)
             self.assertIn("all_folder_paths", inventory)
