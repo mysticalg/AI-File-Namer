@@ -533,6 +533,40 @@ def extract_json_object(raw: str) -> Dict[str, object]:
         return {}
 
 
+def extract_partial_restructure_operations(raw_text: str) -> List[Dict[str, str]]:
+    """Recover folder operations from partially truncated model output.
+
+    This fallback is used when the model returns incomplete JSON (for example a
+    long `operations` list that is cut off before the final closing braces).
+    """
+    if not raw_text:
+        return []
+
+    # Normalize common escaped quoting patterns produced by nested JSON strings.
+    normalized = raw_text.replace('\\"', '"').replace('\\n', '\n')
+    object_pattern = re.compile(r"\{[^{}]*\}", re.DOTALL)
+    operations: List[Dict[str, str]] = []
+
+    for obj_text in object_pattern.findall(normalized):
+        type_match = re.search(r'"type"\s*:\s*"([^"]+)"', obj_text)
+        source_match = re.search(r'"source"\s*:\s*"([^"]+)"', obj_text)
+        destination_match = re.search(r'"destination"\s*:\s*"([^"]+)"', obj_text)
+        if not type_match or not source_match or not destination_match:
+            continue
+        if type_match.group(1).strip().lower() != "folder":
+            continue
+
+        operations.append(
+            {
+                "type": "folder",
+                "source": source_match.group(1).strip(),
+                "destination": destination_match.group(1).strip(),
+            }
+        )
+
+    return operations
+
+
 def extract_restructure_plan(raw: object, max_depth: int = 6) -> Dict[str, object]:
     """Extract a usable restructure plan from raw/nested model payloads.
 
@@ -552,16 +586,30 @@ def extract_restructure_plan(raw: object, max_depth: int = 6) -> Dict[str, objec
 
             for key in ("response", "message", "content", "output", "text"):
                 nested = value.get(key)
-                if isinstance(nested, (dict, str)):
+                if isinstance(nested, dict):
                     result = _walk(nested, depth - 1)
                     if result:
                         return result
+                elif isinstance(nested, str):
+                    result = _walk(nested, depth - 1)
+                    if result:
+                        return result
+
+                    # Fallback for truncated nested strings that still contain complete operations.
+                    partial_ops = extract_partial_restructure_operations(nested)
+                    if partial_ops:
+                        return {"operations": partial_ops, "dedupe_files": True}
             return None
 
         if isinstance(value, str):
             parsed = extract_json_object(value)
             if parsed:
                 return _walk(parsed, depth - 1)
+
+            # If strict JSON extraction fails, try partial operation recovery.
+            partial_ops = extract_partial_restructure_operations(value)
+            if partial_ops:
+                return {"operations": partial_ops, "dedupe_files": True}
 
         return None
 

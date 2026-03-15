@@ -13,6 +13,7 @@ from src.ai_file_namer import (
     FilenamePreferences,
     extract_json_object,
     extract_restructure_plan,
+    extract_partial_restructure_operations,
     format_restructure_preview_paths,
     summarize_debug_headers,
     summarize_debug_payload,
@@ -330,6 +331,27 @@ class FilenameUtilsTests(unittest.TestCase):
         payload = {"model": "mistral", "response": "done"}
         result = extract_restructure_plan(payload)
         self.assertEqual(result, {})
+
+
+    def test_extract_partial_restructure_operations_recovers_complete_items(self):
+        raw = """```json
+{
+  "operations": [
+    {"type": "folder", "source": "Bach", "destination": "Classical"},
+    {"type": "folder", "source": "Mozart", "destination": "Classical"},
+    {"type": "folder", "source": "Incomplete", "destination"
+```"""
+        ops = extract_partial_restructure_operations(raw)
+        self.assertEqual(len(ops), 2)
+        self.assertEqual(ops[0]["source"], "Bach")
+
+    def test_extract_restructure_plan_recovers_from_truncated_nested_response(self):
+        payload = {
+            "response": """{"model":"mistral","response":"```json\n{\n  \"operations\": [\n    {\"type\": \"folder\", \"source\": \"Bach\", \"destination\": \"Classical\"},\n    {\"type\": \"folder\", \"source\": \"Mozart\", \"destination\": \"Classical\"},\n    {\"type\": \"folder\", \"source\": \"Cut\", \"destination\"\n```"}"""
+        }
+        plan = extract_restructure_plan(payload)
+        self.assertIn("operations", plan)
+        self.assertEqual(len(plan["operations"]), 2)
 
 
 if __name__ == "__main__":
