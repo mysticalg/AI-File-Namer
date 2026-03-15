@@ -20,6 +20,8 @@ from src.ai_file_namer import (
     remove_empty_folders,
     sanitize_category_path,
     sanitize_restructure_operations,
+    normalize_ai_source_relative_path,
+    normalize_ai_destination_relative_path,
     build_folder_inventory,
     find_missing_restructure_sources,
     sanitize_filename_stem,
@@ -231,6 +233,75 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertEqual(len(suggestions), 1)
             self.assertEqual(suggestions[0].item_type, "folder")
             self.assertIn("Music", suggestions[0].target_relative)
+
+    def test_normalize_ai_source_relative_path_strips_root_prefix(self):
+        root = Path("/tmp/Bach")
+        self.assertEqual(normalize_ai_source_relative_path("/Bach/Works", root), "Works")
+        self.assertEqual(normalize_ai_source_relative_path("Bach/Works", root), "Works")
+
+    def test_normalize_ai_destination_relative_path_supports_root_destination(self):
+        root = Path("/tmp/Bach")
+        preferences = FilenamePreferences(
+            separator=" ",
+            capitalization="title",
+            max_filename_length=96,
+            max_folder_name_length=32,
+            include_hashtags=False,
+            hashtag_count=3,
+        )
+        self.assertEqual(normalize_ai_destination_relative_path("/Bach", root, preferences), "")
+        self.assertEqual(normalize_ai_destination_relative_path("", root, preferences), "")
+
+    def test_sanitize_restructure_operations_handles_absolute_and_root_destination(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "Bach"
+            works = root / "Works for Solo Lute"
+            works.mkdir(parents=True)
+
+            preferences = FilenamePreferences(
+                separator=" ",
+                capitalization="title",
+                max_filename_length=96,
+                max_folder_name_length=64,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {"type": "folder", "source": "/Bach/Works for Solo Lute", "destination": "/Bach"},
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            # Root destination is accepted and converted into a valid target path.
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0].original_relative, "Works for Solo Lute")
+            self.assertEqual(suggestions[0].target_relative, "Works For Solo Lute")
+
+    def test_sanitize_restructure_operations_handles_nested_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "Bach"
+            child = root / "Works for Solo Lute" / "Partita in C minor - BWV 997"
+            child.mkdir(parents=True)
+
+            preferences = FilenamePreferences(
+                separator=" ",
+                capitalization="title",
+                max_filename_length=96,
+                max_folder_name_length=64,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {
+                    "type": "folder",
+                    "source": "/Bach/Works for Solo Lute/Partita in C minor - BWV 997",
+                    "destination": "/Bach/Partitas",
+                },
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0].original_relative, "Works for Solo Lute/Partita in C minor - BWV 997")
+            self.assertEqual(suggestions[0].target_relative, "Partitas/Partita In C Minor Bwv 997")
 
     def test_sanitize_restructure_operations_ignores_file_operations(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

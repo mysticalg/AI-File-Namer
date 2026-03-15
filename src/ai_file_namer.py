@@ -760,6 +760,35 @@ def format_restructure_preview_paths(original_relative: str, target_relative: st
     return old_path, new_path, transition
 
 
+def normalize_ai_source_relative_path(source_raw: str, root: Path) -> str:
+    """Convert AI `source` values into safe paths relative to the selected root.
+
+    Some models return absolute-style paths (for example `/Bach/...`) or include
+    the selected root name. We normalize those to plain relative paths.
+    """
+    cleaned = source_raw.strip().replace("\\", "/").strip("/")
+    if not cleaned:
+        return ""
+
+    if cleaned == root.name:
+        return ""
+    if cleaned.startswith(f"{root.name}/"):
+        cleaned = cleaned[len(root.name) + 1 :]
+
+    return cleaned.strip("/")
+
+
+def normalize_ai_destination_relative_path(destination_raw: str, root: Path, preferences: FilenamePreferences) -> str:
+    """Convert AI `destination` parent values into safe root-relative paths."""
+    cleaned = destination_raw.strip().replace("\\", "/").strip("/")
+    if not cleaned or cleaned == root.name:
+        return ""
+    if cleaned.startswith(f"{root.name}/"):
+        cleaned = cleaned[len(root.name) + 1 :]
+
+    return sanitize_relative_destination_path(cleaned, preferences)
+
+
 def sanitize_restructure_operations(
     operations: Sequence[Dict[str, object]],
     root: Path,
@@ -771,10 +800,13 @@ def sanitize_restructure_operations(
         source_raw = str(operation.get("source", "")).strip().replace("\\", "/")
         destination_raw = str(operation.get("destination", "")).strip().replace("\\", "/")
         item_type = str(operation.get("type", "folder")).strip().lower()
-        if not source_raw or not destination_raw or item_type != "folder":
+        if not source_raw or item_type != "folder":
             continue
 
-        source_rel = source_raw.strip("/")
+        source_rel = normalize_ai_source_relative_path(source_raw, root)
+        if not source_rel:
+            continue
+
         source_path = (root / source_rel).resolve()
         try:
             source_path.relative_to(root.resolve())
@@ -783,8 +815,12 @@ def sanitize_restructure_operations(
         if not source_path.exists():
             continue
 
-        # destination is a parent path for the source item.
-        sanitized_destination_parent = sanitize_relative_destination_path(destination_raw, preferences)
+        # destination is a parent path for the source item; blank means move to root.
+        sanitized_destination_parent = normalize_ai_destination_relative_path(
+            destination_raw=destination_raw,
+            root=root,
+            preferences=preferences,
+        )
         source_name = sanitize_filename_stem(
             source_path.name,
             separator=preferences.separator,
@@ -793,8 +829,10 @@ def sanitize_restructure_operations(
         )
         if not source_name:
             source_name = source_path.name
-        target_relative = "/".join([part for part in [sanitized_destination_parent, source_name] if part])
-        if not target_relative:
+        target_relative = "/".join([part for part in [sanitized_destination_parent, source_name] if part]) or source_name
+
+        if target_relative.replace("\\", "/").strip("/") == source_rel.replace("\\", "/").strip("/"):
+            # Skip no-op moves so the preview table only shows actionable operations.
             continue
 
         suggestions.append(
@@ -1712,6 +1750,14 @@ class App(tk.Tk):
             raw_operations = plan.get("operations", []) if isinstance(plan, dict) else []
             operation_rows = raw_operations if isinstance(raw_operations, list) else []
             sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
+            if operation_rows and not sanitized:
+                self.ui_queue.put(
+                    (
+                        "status",
+                        "AI returned operations, but none were actionable after sanitization. "
+                        "Try rerunning with a different model or adjust naming settings.",
+                    )
+                )
 
             missing_sources = find_missing_restructure_sources(
                 suggestions=sanitized,
