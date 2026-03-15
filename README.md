@@ -34,7 +34,7 @@ A GitHub Actions workflow is included at `.github/workflows/build-installers.yml
 
 It runs on pushes, PRs, and manual dispatch and produces:
 - **Windows**
-  - `AIFileNamer.exe` via PyInstaller
+  - `AIFileNamer.exe` via PyInstaller (`--onefile`, self-contained)
   - `.msi` installer via cx_Freeze (`bdist_msi`)
 - **macOS**
   - `AIFileNamer.app` via PyInstaller
