@@ -14,7 +14,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -106,11 +106,25 @@ def collect_subfolders(folder: Path, recursive: bool) -> List[Path]:
 class AIProvider:
     """Simple AI provider abstraction supporting local and remote HTTP APIs."""
 
-    def __init__(self, mode: str, endpoint: str, model: str, api_key: str = ""):
+    def __init__(
+        self,
+        mode: str,
+        endpoint: str,
+        model: str,
+        api_key: str = "",
+        debug_callback: Optional[Callable[[str], None]] = None,
+    ):
         self.mode = mode
         self.endpoint = endpoint.strip()
         self.model = model.strip()
         self.api_key = api_key.strip()
+        self.debug_callback = debug_callback
+
+    def _emit_debug(self, title: str, details: Dict[str, object]) -> None:
+        """Send structured AI request/response diagnostics to the UI debug log."""
+        if not self.debug_callback:
+            return
+        self.debug_callback(format_debug_event(title, details))
 
     def suggest_name(
         self,
@@ -145,9 +159,18 @@ class AIProvider:
                 "images": [base64.b64encode(image_bytes).decode("utf-8")],
                 "stream": False,
             }
+            self._emit_debug(
+                "AI request: suggest_name (local)",
+                {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
+            )
             response = requests.post(self.endpoint, json=payload, timeout=60)
             response.raise_for_status()
-            content = response.json().get("response", "")
+            response_json = response.json()
+            content = response_json.get("response", "")
+            self._emit_debug(
+                "AI response: suggest_name (local)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
         else:
             headers = {"Content-Type": "application/json"}
             if self.api_key:
@@ -171,10 +194,23 @@ class AIProvider:
                 ],
                 "max_tokens": 50,
             }
+            self._emit_debug(
+                "AI request: suggest_name (remote)",
+                {
+                    "endpoint": self.endpoint,
+                    "headers": summarize_debug_headers(headers),
+                    "payload": summarize_debug_payload(payload),
+                },
+            )
             response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
-            choices = response.json().get("choices", [])
+            response_json = response.json()
+            choices = response_json.get("choices", [])
             content = choices[0]["message"]["content"] if choices else ""
+            self._emit_debug(
+                "AI response: suggest_name (remote)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
 
         stem = sanitize_filename_stem(
             content,
@@ -218,9 +254,18 @@ class AIProvider:
                 "prompt": prompt,
                 "stream": False,
             }
+            self._emit_debug(
+                "AI request: suggest_folder_name (local)",
+                {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
+            )
             response = requests.post(self.endpoint, json=payload, timeout=60)
             response.raise_for_status()
-            content = response.json().get("response", "")
+            response_json = response.json()
+            content = response_json.get("response", "")
+            self._emit_debug(
+                "AI response: suggest_folder_name (local)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
         else:
             headers = {"Content-Type": "application/json"}
             if self.api_key:
@@ -230,10 +275,23 @@ class AIProvider:
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 40,
             }
+            self._emit_debug(
+                "AI request: suggest_folder_name (remote)",
+                {
+                    "endpoint": self.endpoint,
+                    "headers": summarize_debug_headers(headers),
+                    "payload": summarize_debug_payload(payload),
+                },
+            )
             response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
-            choices = response.json().get("choices", [])
+            response_json = response.json()
+            choices = response_json.get("choices", [])
             content = choices[0]["message"].get("content", "") if choices else ""
+            self._emit_debug(
+                "AI response: suggest_folder_name (remote)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
 
         return (
             sanitize_filename_stem(
@@ -271,9 +329,18 @@ class AIProvider:
                 "prompt": prompt,
                 "stream": False,
             }
+            self._emit_debug(
+                "AI request: suggest_folder_structure (local)",
+                {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
+            )
             response = requests.post(self.endpoint, json=payload, timeout=60)
             response.raise_for_status()
-            content = response.json().get("response", "")
+            response_json = response.json()
+            content = response_json.get("response", "")
+            self._emit_debug(
+                "AI response: suggest_folder_structure (local)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
         else:
             headers = {"Content-Type": "application/json"}
             if self.api_key:
@@ -283,10 +350,23 @@ class AIProvider:
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 40,
             }
+            self._emit_debug(
+                "AI request: suggest_folder_structure (remote)",
+                {
+                    "endpoint": self.endpoint,
+                    "headers": summarize_debug_headers(headers),
+                    "payload": summarize_debug_payload(payload),
+                },
+            )
             response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
-            choices = response.json().get("choices", [])
+            response_json = response.json()
+            choices = response_json.get("choices", [])
             content = choices[0]["message"].get("content", "") if choices else ""
+            self._emit_debug(
+                "AI response: suggest_folder_structure (remote)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
 
         return sanitize_category_path(
             raw=content,
@@ -317,9 +397,18 @@ class AIProvider:
 
         if self.mode == "Local (Ollama /api/generate)":
             payload = {"model": self.model, "prompt": prompt, "stream": False}
+            self._emit_debug(
+                "AI request: suggest_restructure_plan (local)",
+                {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
+            )
             response = requests.post(self.endpoint, json=payload, timeout=120)
             response.raise_for_status()
-            content = response.json().get("response", "")
+            response_json = response.json()
+            content = response_json.get("response", "")
+            self._emit_debug(
+                "AI response: suggest_restructure_plan (local)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
         else:
             headers = {"Content-Type": "application/json"}
             if self.api_key:
@@ -329,12 +418,53 @@ class AIProvider:
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 900,
             }
+            self._emit_debug(
+                "AI request: suggest_restructure_plan (remote)",
+                {
+                    "endpoint": self.endpoint,
+                    "headers": summarize_debug_headers(headers),
+                    "payload": summarize_debug_payload(payload),
+                },
+            )
             response = requests.post(self.endpoint, headers=headers, json=payload, timeout=120)
             response.raise_for_status()
-            choices = response.json().get("choices", [])
+            response_json = response.json()
+            choices = response_json.get("choices", [])
             content = choices[0]["message"].get("content", "") if choices else ""
+            self._emit_debug(
+                "AI response: suggest_restructure_plan (remote)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
 
         return extract_json_object(content)
+
+
+def summarize_debug_payload(payload: object, max_chars: int = 4000) -> str:
+    """Serialize payloads compactly for debug display and cap size for UI responsiveness."""
+    try:
+        serialized = json.dumps(payload, indent=2, ensure_ascii=False)
+    except TypeError:
+        serialized = str(payload)
+
+    if len(serialized) <= max_chars:
+        return serialized
+    return f"{serialized[:max_chars]}... [truncated {len(serialized) - max_chars} chars]"
+
+
+def summarize_debug_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    """Redact secrets in debug headers while keeping request context visible."""
+    redacted = dict(headers)
+    auth_value = redacted.get("Authorization")
+    if auth_value:
+        redacted["Authorization"] = "Bearer ***redacted***"
+    return redacted
+
+
+def format_debug_event(title: str, details: Dict[str, object]) -> str:
+    """Build a timestamped debug event line block for the debug output window."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    body = summarize_debug_payload(details, max_chars=5000)
+    return f"[{timestamp}] {title}\n{body}\n\n"
 
 
 def sanitize_category_path(
@@ -687,6 +817,9 @@ class App(tk.Tk):
         self.ui_queue: queue.Queue = queue.Queue()
         self.folder_row_paths: Dict[str, Path] = {}
         self.sort_state: Dict[str, bool] = {}
+        self.debug_events: List[str] = []
+        self.debug_window: Optional[tk.Toplevel] = None
+        self.debug_text: Optional[tk.Text] = None
 
         self._build_ui()
         self.after(80, self._process_ui_queue)
@@ -699,6 +832,7 @@ class App(tk.Tk):
         ttk.Entry(top, textvariable=self.folder_var).grid(row=0, column=1, sticky="ew", padx=8)
         ttk.Button(top, text="Browse", command=self._select_folder).grid(row=0, column=2, padx=4)
         ttk.Button(top, text="Scan + Suggest", command=self._start_scan).grid(row=0, column=3, padx=4)
+        ttk.Button(top, text="🪵 AI Debug", command=self._open_debug_window).grid(row=0, column=5, padx=4)
 
         option_row = ttk.Frame(top)
         option_row.grid(row=0, column=4, sticky="w", padx=(8, 0))
@@ -911,7 +1045,65 @@ class App(tk.Tk):
             endpoint=self.endpoint_var.get(),
             model=self.model_var.get(),
             api_key=self.api_key_var.get(),
+            debug_callback=self._queue_debug_event,
         )
+
+    def _queue_debug_event(self, message: str) -> None:
+        """Queue debug events from worker threads so UI updates stay thread-safe."""
+        self.ui_queue.put(("debug", message))
+
+    def _open_debug_window(self) -> None:
+        """Open a live debug window showing AI request/response payload summaries."""
+        if self.debug_window and self.debug_window.winfo_exists():
+            self.debug_window.deiconify()
+            self.debug_window.lift()
+            return
+
+        window = tk.Toplevel(self)
+        window.title("AI Debug Output")
+        window.geometry("980x520")
+        window.minsize(760, 380)
+        self.debug_window = window
+
+        controls = ttk.Frame(window, padding=8)
+        controls.pack(fill=tk.X)
+        ttk.Label(
+            controls,
+            text="📡 Live AI request/response log (payloads are truncated; Authorization is redacted).",
+            foreground="#555",
+        ).pack(side=tk.LEFT)
+        ttk.Button(controls, text="🧹 Clear", command=self._clear_debug_output).pack(side=tk.RIGHT)
+
+        text_frame = ttk.Frame(window, padding=(8, 0, 8, 8))
+        text_frame.pack(fill=tk.BOTH, expand=True)
+        self.debug_text = tk.Text(text_frame, wrap="word", font=("Consolas", 10))
+        yscroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.debug_text.yview)
+        self.debug_text.configure(yscrollcommand=yscroll.set)
+        self.debug_text.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+
+        for event in self.debug_events:
+            self.debug_text.insert(tk.END, event)
+        self.debug_text.see(tk.END)
+
+    def _clear_debug_output(self) -> None:
+        """Clear debug event history and on-screen debug text."""
+        self.debug_events.clear()
+        if self.debug_text and self.debug_text.winfo_exists():
+            self.debug_text.delete("1.0", tk.END)
+
+    def _append_debug_output(self, message: str) -> None:
+        """Append one debug event entry and keep memory bounded for long sessions."""
+        self.debug_events.append(message)
+        max_events = 500
+        if len(self.debug_events) > max_events:
+            self.debug_events = self.debug_events[-max_events:]
+
+        if self.debug_text and self.debug_text.winfo_exists():
+            self.debug_text.insert(tk.END, message)
+            self.debug_text.see(tk.END)
 
     def _handle_mode_change(self) -> None:
         """Adjust defaults and API key availability based on selected provider."""
@@ -1416,6 +1608,8 @@ class App(tk.Tk):
                 self.folder_row_paths[row_id] = move_rec.source_path
             elif kind == "status":
                 self.status_var.set(msg[1])
+            elif kind == "debug":
+                self._append_debug_output(msg[1])
 
         self.after(80, self._process_ui_queue)
 

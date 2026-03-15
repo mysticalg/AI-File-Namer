@@ -13,6 +13,8 @@ from src.ai_file_namer import (
     FilenamePreferences,
     extract_json_object,
     format_restructure_preview_paths,
+    summarize_debug_headers,
+    summarize_debug_payload,
     remove_empty_folders,
     sanitize_category_path,
     sanitize_restructure_operations,
@@ -207,6 +209,17 @@ class FilenameUtilsTests(unittest.TestCase):
         self.assertEqual(old_path, "old/nested")
         self.assertEqual(new_path, "new/bucket/old")
         self.assertEqual(transition, "old/nested → new/bucket/old")
+
+    def test_summarize_debug_headers_redacts_authorization(self):
+        headers = {"Authorization": "Bearer secret-token", "Content-Type": "application/json"}
+        result = summarize_debug_headers(headers)
+        self.assertEqual(result["Authorization"], "Bearer ***redacted***")
+        self.assertEqual(result["Content-Type"], "application/json")
+
+    def test_summarize_debug_payload_truncates_large_content(self):
+        payload = {"x": "a" * 6000}
+        result = summarize_debug_payload(payload, max_chars=120)
+        self.assertIn("truncated", result)
 
 
 if __name__ == "__main__":
