@@ -452,7 +452,7 @@ class AIProvider:
                 {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
             )
 
-        return extract_json_object(content)
+        return extract_restructure_plan(content)
 
 
 def summarize_debug_payload(payload: object, max_chars: int = 4000) -> str:
@@ -531,6 +531,41 @@ def extract_json_object(raw: str) -> Dict[str, object]:
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         return {}
+
+
+def extract_restructure_plan(raw: object, max_depth: int = 6) -> Dict[str, object]:
+    """Extract a usable restructure plan from raw/nested model payloads.
+
+    Some providers (or model responses) wrap the desired plan JSON inside an envelope
+    object/string (for example, inside a nested `response` field). This helper walks
+    nested values to recover the first object that actually contains `operations`.
+    """
+
+    def _walk(value: object, depth: int) -> Optional[Dict[str, object]]:
+        if depth <= 0:
+            return None
+
+        if isinstance(value, dict):
+            operations = value.get("operations")
+            if isinstance(operations, list):
+                return value
+
+            for key in ("response", "message", "content", "output", "text"):
+                nested = value.get(key)
+                if isinstance(nested, (dict, str)):
+                    result = _walk(nested, depth - 1)
+                    if result:
+                        return result
+            return None
+
+        if isinstance(value, str):
+            parsed = extract_json_object(value)
+            if parsed:
+                return _walk(parsed, depth - 1)
+
+        return None
+
+    return _walk(raw, max_depth) or {}
 
 
 def parse_ollama_model_names(payload: Dict[str, object]) -> List[str]:

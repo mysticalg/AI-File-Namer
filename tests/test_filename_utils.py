@@ -12,6 +12,7 @@ from src.ai_file_namer import (
     group_duplicate_folders,
     FilenamePreferences,
     extract_json_object,
+    extract_restructure_plan,
     format_restructure_preview_paths,
     summarize_debug_headers,
     summarize_debug_payload,
@@ -314,6 +315,21 @@ class FilenameUtilsTests(unittest.TestCase):
             build_ollama_tags_endpoint("http://host:11434/custom"),
             "http://host:11434/custom/api/tags",
         )
+
+
+    def test_extract_restructure_plan_reads_nested_response_envelope(self):
+        payload = {
+            "model": "mistral",
+            "response": "{\"operations\":[{\"type\":\"folder\",\"source\":\"a\",\"destination\":\"music\"}],\"dedupe_files\":true}",
+        }
+        result = extract_restructure_plan(payload)
+        self.assertIn("operations", result)
+        self.assertEqual(len(result["operations"]), 1)
+
+    def test_extract_restructure_plan_returns_empty_for_non_plan_payload(self):
+        payload = {"model": "mistral", "response": "done"}
+        result = extract_restructure_plan(payload)
+        self.assertEqual(result, {})
 
 
 if __name__ == "__main__":
