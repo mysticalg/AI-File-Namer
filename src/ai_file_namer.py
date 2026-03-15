@@ -31,6 +31,7 @@ DEFAULT_LOCAL_ENDPOINT = "http://localhost:11434/api/generate"
 DEFAULT_REMOTE_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 DEFAULT_LOCAL_MODEL = "llava"
 DEFAULT_REMOTE_MODEL = "gpt-4o-mini"
+DEFAULT_AI_TIMEOUT_SECONDS = 120
 
 
 def default_settings_path() -> Path:
@@ -66,6 +67,12 @@ def _coerce_int_setting(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def clamp_ai_timeout_seconds(value: Any) -> int:
+    """Clamp timeout settings to a safe, user-adjustable range."""
+    parsed = _coerce_int_setting(value, DEFAULT_AI_TIMEOUT_SECONDS)
+    return max(30, min(parsed, 3600))
 
 
 @dataclass
@@ -155,12 +162,14 @@ class AIProvider:
         model: str,
         api_key: str = "",
         debug_callback: Optional[Callable[[str], None]] = None,
+        timeout_seconds: int = DEFAULT_AI_TIMEOUT_SECONDS,
     ):
         self.mode = mode
         self.endpoint = endpoint.strip()
         self.model = model.strip()
         self.api_key = api_key.strip()
         self.debug_callback = debug_callback
+        self.timeout_seconds = clamp_ai_timeout_seconds(timeout_seconds)
 
     def _emit_debug(self, title: str, details: Dict[str, object]) -> None:
         """Send structured AI request/response diagnostics to the UI debug log."""
@@ -205,7 +214,7 @@ class AIProvider:
                 "AI request: suggest_name (local)",
                 {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
             )
-            response = requests.post(self.endpoint, json=payload, timeout=60)
+            response = requests.post(self.endpoint, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             content = response_json.get("response", "")
@@ -244,7 +253,7 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             choices = response_json.get("choices", [])
@@ -300,7 +309,7 @@ class AIProvider:
                 "AI request: suggest_folder_name (local)",
                 {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
             )
-            response = requests.post(self.endpoint, json=payload, timeout=60)
+            response = requests.post(self.endpoint, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             content = response_json.get("response", "")
@@ -325,7 +334,7 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             choices = response_json.get("choices", [])
@@ -375,7 +384,7 @@ class AIProvider:
                 "AI request: suggest_folder_structure (local)",
                 {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
             )
-            response = requests.post(self.endpoint, json=payload, timeout=60)
+            response = requests.post(self.endpoint, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             content = response_json.get("response", "")
@@ -400,7 +409,7 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             choices = response_json.get("choices", [])
@@ -461,7 +470,7 @@ class AIProvider:
                 "AI request: suggest_restructure_plan (local)",
                 {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
             )
-            response = requests.post(self.endpoint, json=payload, timeout=120)
+            response = requests.post(self.endpoint, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             content = response_json.get("response", "")
@@ -486,7 +495,7 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=120)
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             choices = response_json.get("choices", [])
@@ -1007,6 +1016,7 @@ class App(tk.Tk):
         self.include_hashtags_var = tk.BooleanVar(value=bool(loaded_settings.get("include_hashtags", False)))
         self.hashtag_count_var = tk.IntVar(value=_coerce_int_setting(loaded_settings.get("hashtag_count", 3), 3))
         self.dedupe_keep_var = tk.StringVar(value=str(loaded_settings.get("dedupe_keep", "Keep first match")))
+        self.ai_timeout_seconds_var = tk.IntVar(value=clamp_ai_timeout_seconds(loaded_settings.get("ai_timeout_seconds", DEFAULT_AI_TIMEOUT_SECONDS)))
         self.status_var = tk.StringVar(value="Choose a folder and generate AI suggestions.")
 
         # Store per-provider endpoint/model preferences so mode switches don't erase user values.
@@ -1101,11 +1111,21 @@ class App(tk.Tk):
         self.api_entry = ttk.Entry(ai_frame, textvariable=self.api_key_var, show="*")
         self.api_entry.grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
 
+        ttk.Label(ai_frame, text="⏱️ AI timeout (sec)").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Spinbox(
+            ai_frame,
+            from_=30,
+            to=3600,
+            increment=30,
+            textvariable=self.ai_timeout_seconds_var,
+            width=10,
+        ).grid(row=4, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+
         ttk.Label(
             ai_frame,
-            text="Tip: Local mode can auto-load installed Ollama models.",
+            text="Tip: Default is 120s. Increase this for slower models or large media inputs.",
             foreground="#666",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
 
         # 3) Naming section: filename/folder conventions together for predictability.
         naming_frame = ttk.LabelFrame(top, text="✍️ Naming Rules")
@@ -1312,6 +1332,7 @@ class App(tk.Tk):
             "include_hashtags": self.include_hashtags_var.get(),
             "hashtag_count": self.hashtag_count_var.get(),
             "dedupe_keep": self.dedupe_keep_var.get(),
+            "ai_timeout_seconds": clamp_ai_timeout_seconds(self.ai_timeout_seconds_var.get()),
             "local_endpoint": self.local_endpoint,
             "remote_endpoint": self.remote_endpoint,
             "local_model": self.local_model,
@@ -1344,6 +1365,7 @@ class App(tk.Tk):
             self.include_hashtags_var,
             self.hashtag_count_var,
             self.dedupe_keep_var,
+            self.ai_timeout_seconds_var,
         ]
         for variable in tracked_vars:
             variable.trace_add("write", self._save_settings)
@@ -1361,6 +1383,7 @@ class App(tk.Tk):
             model=self.model_var.get(),
             api_key=self.api_key_var.get(),
             debug_callback=self._queue_debug_event,
+            timeout_seconds=clamp_ai_timeout_seconds(self.ai_timeout_seconds_var.get()),
         )
 
     def _queue_debug_event(self, message: str) -> None:

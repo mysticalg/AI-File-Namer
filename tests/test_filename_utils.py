@@ -27,10 +27,17 @@ from src.ai_file_namer import (
     parse_ollama_model_names,
     load_app_settings,
     save_app_settings,
+    clamp_ai_timeout_seconds,
 )
 
 
 class FilenameUtilsTests(unittest.TestCase):
+
+    def test_clamp_ai_timeout_seconds_respects_bounds(self):
+        self.assertEqual(clamp_ai_timeout_seconds(120), 120)
+        self.assertEqual(clamp_ai_timeout_seconds(5), 30)
+        self.assertEqual(clamp_ai_timeout_seconds("9999"), 3600)
+        self.assertEqual(clamp_ai_timeout_seconds("bad"), 120)
 
     def test_load_app_settings_returns_empty_for_missing_or_invalid_files(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -48,6 +55,7 @@ class FilenameUtilsTests(unittest.TestCase):
                 "endpoint": "https://example.test/v1/chat/completions",
                 "recursive_scan": False,
                 "max_filename_length": 88,
+                "ai_timeout_seconds": 240,
             }
 
             save_app_settings(payload, settings_path)
