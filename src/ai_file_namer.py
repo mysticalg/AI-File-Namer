@@ -516,8 +516,9 @@ class App(tk.Tk):
         self.recursive_folder_rename_var = tk.BooleanVar(value=True)
         self.restructure_recursive_var = tk.BooleanVar(value=True)
         self.date_format_var = tk.StringVar(value="%Y-%m-%d")
-        self.word_separator_var = tk.StringVar(value="Underscores (_)")
-        self.capitalization_var = tk.StringVar(value="lowercase")
+        # Default to human-readable names as requested: spaces + title case.
+        self.word_separator_var = tk.StringVar(value="White spaces ( )")
+        self.capitalization_var = tk.StringVar(value="Title Case")
         self.max_filename_length_var = tk.IntVar(value=96)
         self.max_folder_name_length_var = tk.IntVar(value=96)
         self.include_hashtags_var = tk.BooleanVar(value=False)
