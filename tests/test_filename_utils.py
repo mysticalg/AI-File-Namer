@@ -12,13 +12,19 @@ from src.ai_file_namer import (
     group_duplicate_folders,
     FilenamePreferences,
     extract_json_object,
+    extract_restructure_plan,
+    extract_partial_restructure_operations,
     format_restructure_preview_paths,
     summarize_debug_headers,
     summarize_debug_payload,
     remove_empty_folders,
     sanitize_category_path,
     sanitize_restructure_operations,
+    build_folder_inventory,
+    find_missing_restructure_sources,
     sanitize_filename_stem,
+    build_ollama_tags_endpoint,
+    parse_ollama_model_names,
 )
 
 
@@ -188,9 +194,50 @@ class FilenameUtilsTests(unittest.TestCase):
             ]
 
             suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
-            self.assertEqual(len(suggestions), 2)
+            self.assertEqual(len(suggestions), 1)
             self.assertEqual(suggestions[0].item_type, "folder")
             self.assertIn("Music", suggestions[0].target_relative)
+
+    def test_sanitize_restructure_operations_ignores_file_operations(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            folder = root / "media"
+            folder.mkdir()
+            (folder / "clip.mp4").write_text("x")
+
+            preferences = FilenamePreferences(
+                separator="_",
+                capitalization="lower",
+                max_filename_length=96,
+                max_folder_name_length=32,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {"type": "file", "source": "media/clip.mp4", "destination": "video/clips"},
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            self.assertEqual(suggestions, [])
+
+    def test_build_folder_inventory_returns_folder_only_payload(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "photos" / "travel").mkdir(parents=True)
+            (root / "photos" / "family").mkdir(parents=True)
+            (root / "photos" / "image1.jpg").write_text("x")
+
+            inventory = build_folder_inventory(root, recursive=True)
+
+            self.assertEqual(inventory["root"], root.name)
+            self.assertNotIn("files", inventory)
+            self.assertNotIn("file_count", inventory)
+            self.assertIn("all_folder_paths", inventory)
+            self.assertGreaterEqual(len(inventory["all_folder_paths"]), 3)
+            first_row = inventory["folders"][0]
+            self.assertIn("direct_subfolder_count", first_row)
+            self.assertIn("sample_subfolders", first_row)
+            self.assertNotIn("sample_files", first_row)
 
     def test_format_restructure_preview_paths_outputs_old_new_and_transition(self):
         old_path, new_path, transition = format_restructure_preview_paths(
@@ -220,6 +267,91 @@ class FilenameUtilsTests(unittest.TestCase):
         payload = {"x": "a" * 6000}
         result = summarize_debug_payload(payload, max_chars=120)
         self.assertIn("truncated", result)
+
+
+    def test_find_missing_restructure_sources_identifies_uncovered_folders(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "photos").mkdir()
+            (root / "videos").mkdir()
+
+            preferences = FilenamePreferences(
+                separator="_",
+                capitalization="lower",
+                max_filename_length=96,
+                max_folder_name_length=32,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [{"type": "folder", "source": "photos", "destination": "media"}]
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+
+            missing = find_missing_restructure_sources(
+                suggestions=suggestions,
+                root=root,
+                candidate_folders=collect_subfolders(root, recursive=False),
+            )
+            self.assertEqual(missing, ["videos"])
+
+
+    def test_parse_ollama_model_names_sorts_and_deduplicates(self):
+        payload = {
+            "models": [
+                {"name": "llava"},
+                {"name": "mistral"},
+                {"name": "LLaVA"},
+                {"name": ""},
+                {},
+            ]
+        }
+        names = parse_ollama_model_names(payload)
+        self.assertEqual(names, ["llava", "mistral"])
+
+    def test_build_ollama_tags_endpoint_maps_generate_to_tags(self):
+        self.assertEqual(
+            build_ollama_tags_endpoint("http://localhost:11434/api/generate"),
+            "http://localhost:11434/api/tags",
+        )
+        self.assertEqual(
+            build_ollama_tags_endpoint("http://host:11434/custom"),
+            "http://host:11434/custom/api/tags",
+        )
+
+
+    def test_extract_restructure_plan_reads_nested_response_envelope(self):
+        payload = {
+            "model": "mistral",
+            "response": "{\"operations\":[{\"type\":\"folder\",\"source\":\"a\",\"destination\":\"music\"}],\"dedupe_files\":true}",
+        }
+        result = extract_restructure_plan(payload)
+        self.assertIn("operations", result)
+        self.assertEqual(len(result["operations"]), 1)
+
+    def test_extract_restructure_plan_returns_empty_for_non_plan_payload(self):
+        payload = {"model": "mistral", "response": "done"}
+        result = extract_restructure_plan(payload)
+        self.assertEqual(result, {})
+
+
+    def test_extract_partial_restructure_operations_recovers_complete_items(self):
+        raw = """```json
+{
+  "operations": [
+    {"type": "folder", "source": "Bach", "destination": "Classical"},
+    {"type": "folder", "source": "Mozart", "destination": "Classical"},
+    {"type": "folder", "source": "Incomplete", "destination"
+```"""
+        ops = extract_partial_restructure_operations(raw)
+        self.assertEqual(len(ops), 2)
+        self.assertEqual(ops[0]["source"], "Bach")
+
+    def test_extract_restructure_plan_recovers_from_truncated_nested_response(self):
+        payload = {
+            "response": """{"model":"mistral","response":"```json\n{\n  \"operations\": [\n    {\"type\": \"folder\", \"source\": \"Bach\", \"destination\": \"Classical\"},\n    {\"type\": \"folder\", \"source\": \"Mozart\", \"destination\": \"Classical\"},\n    {\"type\": \"folder\", \"source\": \"Cut\", \"destination\"\n```"}"""
+        }
+        plan = extract_restructure_plan(payload)
+        self.assertIn("operations", plan)
+        self.assertEqual(len(plan["operations"]), 2)
 
 
 if __name__ == "__main__":

@@ -377,8 +377,17 @@ class AIProvider:
         )
 
 
-    def suggest_restructure_plan(self, inventory: Dict[str, object], preferences: FilenamePreferences) -> Dict[str, object]:
-        """Request a full-tree restructure plan so AI can reason across all subfolders at once."""
+    def suggest_restructure_plan(
+        self,
+        inventory: Dict[str, object],
+        preferences: FilenamePreferences,
+        extra_instruction: str = "",
+    ) -> Dict[str, object]:
+        """Request a full-tree folder-only restructure plan.
+
+        The planner works from the root inventory in one pass and returns a complete
+        folder path proposal rather than recursively planning each subtree.
+        """
         import requests
 
         style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
@@ -386,12 +395,19 @@ class AIProvider:
         prompt = (
             "You are organizing a messy folder tree. "
             "Return JSON only with shape: "
-            "{\"operations\": [{\"type\": \"folder|file\", \"source\": \"relative/path\", \"destination\": \"relative/parent/path\"}], "
+            "{\"operations\": [{\"type\": \"folder\", \"source\": \"relative/path\", \"destination\": \"relative/parent/path\"}], "
+            "\"reorganized_structure\": [\"relative/final/folder/path\"], "
             "\"dedupe_files\": true}. "
+            "Only include folder operations, never file operations. "
             "Destination is the target parent path, not final file/folder name. "
+            "The reorganized_structure list must represent the full final folder tree from the root. "
+            "Plan once from the root inventory (do not recursively re-plan each subfolder). "
             "Use shallow logical categories and consolidate duplicates. "
             f"Use {style_description} and {case_description}. "
             "Do not include markdown. "
+            "Every source folder should appear exactly once in operations (unless intentionally unchanged). "
+            "Group semantically similar folders under shared parent categories. "
+            f"{extra_instruction} "
             f"Inventory: {json.dumps(inventory)}"
         )
 
@@ -436,7 +452,7 @@ class AIProvider:
                 {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
             )
 
-        return extract_json_object(content)
+        return extract_restructure_plan(content)
 
 
 def summarize_debug_payload(payload: object, max_chars: int = 4000) -> str:
@@ -517,31 +533,170 @@ def extract_json_object(raw: str) -> Dict[str, object]:
         return {}
 
 
-def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
-    """Build a compact representation of the current folder structure for AI planning."""
-    folders = collect_subfolders(folder, recursive=recursive)
-    max_nodes = 240
-    folder_rows: List[Dict[str, object]] = []
-    for subfolder in folders[:max_nodes]:
-        rel = str(subfolder.relative_to(folder)).replace("\\", "/")
-        files = [child.name for child in sorted(subfolder.iterdir()) if child.is_file()]
-        folder_rows.append(
+def extract_partial_restructure_operations(raw_text: str) -> List[Dict[str, str]]:
+    """Recover folder operations from partially truncated model output.
+
+    This fallback is used when the model returns incomplete JSON (for example a
+    long `operations` list that is cut off before the final closing braces).
+    """
+    if not raw_text:
+        return []
+
+    # Normalize common escaped quoting patterns produced by nested JSON strings.
+    normalized = raw_text.replace('\\"', '"').replace('\\n', '\n')
+    object_pattern = re.compile(r"\{[^{}]*\}", re.DOTALL)
+    operations: List[Dict[str, str]] = []
+
+    for obj_text in object_pattern.findall(normalized):
+        type_match = re.search(r'"type"\s*:\s*"([^"]+)"', obj_text)
+        source_match = re.search(r'"source"\s*:\s*"([^"]+)"', obj_text)
+        destination_match = re.search(r'"destination"\s*:\s*"([^"]+)"', obj_text)
+        if not type_match or not source_match or not destination_match:
+            continue
+        if type_match.group(1).strip().lower() != "folder":
+            continue
+
+        operations.append(
             {
-                "folder": rel,
-                "direct_file_count": len(files),
-                "sample_files": files[:8],
+                "type": "folder",
+                "source": source_match.group(1).strip(),
+                "destination": destination_match.group(1).strip(),
             }
         )
 
-    all_files = [p for p in folder.glob("**/*") if p.is_file()] if recursive else [p for p in folder.glob("*") if p.is_file()]
-    file_rows = [str(path.relative_to(folder)).replace("\\", "/") for path in sorted(all_files)[:400]]
+    return operations
+
+
+def extract_restructure_plan(raw: object, max_depth: int = 6) -> Dict[str, object]:
+    """Extract a usable restructure plan from raw/nested model payloads.
+
+    Some providers (or model responses) wrap the desired plan JSON inside an envelope
+    object/string (for example, inside a nested `response` field). This helper walks
+    nested values to recover the first object that actually contains `operations`.
+    """
+
+    def _walk(value: object, depth: int) -> Optional[Dict[str, object]]:
+        if depth <= 0:
+            return None
+
+        if isinstance(value, dict):
+            operations = value.get("operations")
+            if isinstance(operations, list):
+                return value
+
+            for key in ("response", "message", "content", "output", "text"):
+                nested = value.get(key)
+                if isinstance(nested, dict):
+                    result = _walk(nested, depth - 1)
+                    if result:
+                        return result
+                elif isinstance(nested, str):
+                    result = _walk(nested, depth - 1)
+                    if result:
+                        return result
+
+                    # Fallback for truncated nested strings that still contain complete operations.
+                    partial_ops = extract_partial_restructure_operations(nested)
+                    if partial_ops:
+                        return {"operations": partial_ops, "dedupe_files": True}
+            return None
+
+        if isinstance(value, str):
+            parsed = extract_json_object(value)
+            if parsed:
+                return _walk(parsed, depth - 1)
+
+            # If strict JSON extraction fails, try partial operation recovery.
+            partial_ops = extract_partial_restructure_operations(value)
+            if partial_ops:
+                return {"operations": partial_ops, "dedupe_files": True}
+
+        return None
+
+    return _walk(raw, max_depth) or {}
+
+
+def parse_ollama_model_names(payload: Dict[str, object]) -> List[str]:
+    """Extract sorted unique model names from Ollama `/api/tags` payload."""
+    models = payload.get("models", [])
+    if not isinstance(models, list):
+        return []
+
+    canonical_by_lower: Dict[str, str] = {}
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        raw_name = model.get("name")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            continue
+
+        cleaned_name = raw_name.strip()
+        lower_name = cleaned_name.lower()
+        if lower_name not in canonical_by_lower:
+            canonical_by_lower[lower_name] = cleaned_name
+
+    return [canonical_by_lower[key] for key in sorted(canonical_by_lower)]
+
+
+def build_ollama_tags_endpoint(generate_endpoint: str) -> str:
+    """Convert a configured Ollama generate endpoint into a tags endpoint."""
+    base = generate_endpoint.strip() or "http://localhost:11434/api/generate"
+    if "/api/" in base:
+        prefix = base.split("/api/", 1)[0]
+    else:
+        prefix = base.rstrip("/")
+    return f"{prefix}/api/tags"
+
+
+def fetch_ollama_model_names(generate_endpoint: str, timeout_seconds: int = 8) -> List[str]:
+    """Fetch locally available Ollama model names for dropdown selection."""
+    import requests
+
+    tags_endpoint = build_ollama_tags_endpoint(generate_endpoint)
+    response = requests.get(tags_endpoint, timeout=timeout_seconds)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        return []
+    return parse_ollama_model_names(payload)
+
+
+def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
+    """Build a compact folder-only representation for AI restructure planning."""
+    folders = collect_subfolders(folder, recursive=recursive)
+    max_nodes = 240
+    folder_rows: List[Dict[str, object]] = []
+    folder_paths = [str(path.relative_to(folder)).replace("\\", "/") for path in folders]
+    for subfolder in folders[:max_nodes]:
+        rel = str(subfolder.relative_to(folder)).replace("\\", "/")
+        direct_folders = [child.name for child in sorted(subfolder.iterdir()) if child.is_dir()]
+        folder_rows.append(
+            {
+                "folder": rel,
+                # Keep payload folder-only so restructure prompts stay focused and lightweight.
+                "direct_subfolder_count": len(direct_folders),
+                "sample_subfolders": direct_folders[:8],
+            }
+        )
+
     return {
         "root": folder.name,
         "folder_count": len(folders),
-        "file_count": len(all_files),
+        # Full path list helps the model return one complete grouped structure in one response.
+        "all_folder_paths": folder_paths[:600],
         "folders": folder_rows,
-        "files": file_rows,
     }
+
+
+def find_missing_restructure_sources(
+    suggestions: Sequence[FolderStructureSuggestion],
+    root: Path,
+    candidate_folders: Sequence[Path],
+) -> List[str]:
+    """Return relative folder paths missing from the AI move suggestions."""
+    expected = {str(path.relative_to(root)).replace("\\", "/") for path in candidate_folders}
+    provided = {item.original_relative.replace("\\", "/") for item in suggestions}
+    return sorted(expected - provided)
 
 
 def format_restructure_preview_paths(original_relative: str, target_relative: str) -> Tuple[str, str, str]:
@@ -563,7 +718,7 @@ def sanitize_restructure_operations(
         source_raw = str(operation.get("source", "")).strip().replace("\\", "/")
         destination_raw = str(operation.get("destination", "")).strip().replace("\\", "/")
         item_type = str(operation.get("type", "folder")).strip().lower()
-        if not source_raw or not destination_raw or item_type not in {"folder", "file"}:
+        if not source_raw or not destination_raw or item_type != "folder":
             continue
 
         source_rel = source_raw.strip("/")
@@ -820,184 +975,215 @@ class App(tk.Tk):
         self.debug_events: List[str] = []
         self.debug_window: Optional[tk.Toplevel] = None
         self.debug_text: Optional[tk.Text] = None
+        self.ollama_models: List[str] = []
 
         self._build_ui()
         self.after(80, self._process_ui_queue)
 
     def _build_ui(self) -> None:
+        """Build a sectioned, task-first layout so scanning, provider setup, and actions are easy to follow."""
         top = ttk.Frame(self, padding=12)
         top.pack(fill=tk.X)
+        top.columnconfigure(0, weight=1)
+        top.columnconfigure(1, weight=1)
 
-        ttk.Label(top, text="📂 Folder", width=12).grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.folder_var).grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(top, text="Browse", command=self._select_folder).grid(row=0, column=2, padx=4)
-        ttk.Button(top, text="Scan + Suggest", command=self._start_scan).grid(row=0, column=3, padx=4)
-        ttk.Button(top, text="🪵 AI Debug", command=self._open_debug_window).grid(row=0, column=5, padx=4)
+        # 1) Source section: choose input folder and run primary scan action.
+        source_frame = ttk.LabelFrame(top, text="📂 Source")
+        source_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
+        source_frame.columnconfigure(1, weight=1)
 
-        option_row = ttk.Frame(top)
-        option_row.grid(row=0, column=4, sticky="w", padx=(8, 0))
+        ttk.Label(source_frame, text="Folder").grid(row=0, column=0, sticky="w", padx=8, pady=8)
+        ttk.Entry(source_frame, textvariable=self.folder_var).grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=8)
+        ttk.Button(source_frame, text="Browse", command=self._select_folder).grid(row=0, column=2, padx=4, pady=8)
+        ttk.Button(source_frame, text="Scan + Suggest", command=self._start_scan).grid(row=0, column=3, padx=4, pady=8)
+        ttk.Button(source_frame, text="🪵 AI Debug", command=self._open_debug_window).grid(row=0, column=4, padx=(4, 8), pady=8)
+
         ttk.Checkbutton(
-            option_row,
+            source_frame,
             text="Recursive files",
             variable=self.recursive_scan_var,
-        ).pack(side=tk.LEFT)
+        ).grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(0, 8))
         ttk.Label(
-            option_row,
-            text="Looks inside subfolders",
+            source_frame,
+            text="Scans files in all subfolders.",
             foreground="#666",
-        ).pack(side=tk.LEFT, padx=(6, 0))
+        ).grid(row=1, column=2, columnspan=3, sticky="w", pady=(0, 8))
 
-        ttk.Label(top, text="🧠 AI Mode", width=12).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        # 2) AI section: provider, endpoint, model and auth grouped together.
+        ai_frame = ttk.LabelFrame(top, text="🧠 AI Provider")
+        ai_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0), padx=(0, 6))
+        ai_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(ai_frame, text="Mode").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
         mode_combo = ttk.Combobox(
-            top,
+            ai_frame,
             textvariable=self.provider_mode_var,
             values=["Local (Ollama /api/generate)", "Remote (OpenAI-compatible /v1/chat/completions)"],
             state="readonly",
         )
-        mode_combo.grid(row=1, column=1, sticky="ew", padx=8, pady=(10, 0))
+        mode_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
         mode_combo.bind("<<ComboboxSelected>>", lambda _: self._handle_mode_change())
 
-        ttk.Label(top, text="🌐 Endpoint").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(top, textvariable=self.endpoint_var).grid(row=2, column=1, sticky="ew", padx=8, pady=(10, 0))
+        ttk.Label(ai_frame, text="Endpoint").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Entry(ai_frame, textvariable=self.endpoint_var).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
 
-        ttk.Label(top, text="🧩 Model").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(top, textvariable=self.model_var).grid(row=3, column=1, sticky="ew", padx=8, pady=(10, 0))
+        ttk.Label(ai_frame, text="Model").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
+        model_row = ttk.Frame(ai_frame)
+        model_row.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        model_row.columnconfigure(0, weight=1)
+        self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var)
+        self.model_combo.grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            model_row,
+            text="↻ Fetch Ollama Models",
+            command=self._start_ollama_model_refresh,
+        ).grid(row=0, column=1, padx=(6, 0))
 
-        ttk.Label(top, text="🔐 API Key").grid(row=4, column=0, sticky="w", pady=(10, 0))
-        self.api_entry = ttk.Entry(top, textvariable=self.api_key_var, show="*")
-        self.api_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=(10, 0))
+        ttk.Label(ai_frame, text="API Key").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
+        self.api_entry = ttk.Entry(ai_frame, textvariable=self.api_key_var, show="*")
+        self.api_entry.grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
 
-        date_row = ttk.Frame(top)
-        date_row.grid(row=1, column=2, columnspan=3, sticky="w", padx=8)
-        ttk.Checkbutton(
-            date_row,
-            text="Include date",
-            variable=self.include_date_var,
-        ).pack(side=tk.LEFT)
-        ttk.Label(date_row, text="Format:").pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Entry(date_row, width=14, textvariable=self.date_format_var).pack(side=tk.LEFT)
         ttk.Label(
-            date_row,
-            text="(strftime, e.g. %Y-%m-%d)",
+            ai_frame,
+            text="Tip: Local mode can auto-load installed Ollama models.",
             foreground="#666",
-        ).pack(side=tk.LEFT, padx=8)
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
 
-        naming_row = ttk.Frame(top)
-        naming_row.grid(row=4, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
-        ttk.Label(naming_row, text="🧰 Separator:").pack(side=tk.LEFT)
+        # 3) Naming section: filename/folder conventions together for predictability.
+        naming_frame = ttk.LabelFrame(top, text="✍️ Naming Rules")
+        naming_frame.grid(row=1, column=1, sticky="nsew", pady=(10, 0), padx=(6, 0))
+        naming_frame.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            naming_frame,
+            text="Include date prefix",
+            variable=self.include_date_var,
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(naming_frame, text="Format").grid(row=0, column=1, sticky="e", padx=(0, 4), pady=(8, 0))
+        ttk.Entry(naming_frame, width=14, textvariable=self.date_format_var).grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(
+            naming_frame,
+            text="(strftime e.g. %Y-%m-%d)",
+            foreground="#666",
+        ).grid(row=0, column=3, sticky="w", padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(naming_frame, text="Separator").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Combobox(
-            naming_row,
+            naming_frame,
             width=18,
             textvariable=self.word_separator_var,
             state="readonly",
             values=["Underscores (_)", "White spaces ( )"],
-        ).pack(side=tk.LEFT, padx=(6, 10))
-        ttk.Label(naming_row, text="🔠 Case:").pack(side=tk.LEFT)
+        ).grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(naming_frame, text="Case").grid(row=1, column=2, sticky="e", padx=(0, 4), pady=(8, 0))
         ttk.Combobox(
-            naming_row,
+            naming_frame,
             width=12,
             textvariable=self.capitalization_var,
             state="readonly",
             values=["lowercase", "Title Case"],
-        ).pack(side=tk.LEFT, padx=(6, 10))
-        ttk.Label(naming_row, text="📏 Max filename length:").pack(side=tk.LEFT)
+        ).grid(row=1, column=3, sticky="w", padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(naming_frame, text="Max filename length").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Spinbox(
-            naming_row,
+            naming_frame,
             from_=16,
             to=MAX_WINDOWS_FILENAME_LENGTH,
             width=6,
             textvariable=self.max_filename_length_var,
-        ).pack(side=tk.LEFT, padx=(6, 4))
-        ttk.Label(naming_row, text="(includes date + extension)", foreground="#666").pack(side=tk.LEFT)
+        ).grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(
+            naming_frame,
+            text="Includes date + extension",
+            foreground="#666",
+        ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(8, 0))
 
-        folder_name_row = ttk.Frame(top)
-        folder_name_row.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(folder_name_row, text="📁 Max folder name length:").pack(side=tk.LEFT)
+        ttk.Label(naming_frame, text="Max folder name length").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Spinbox(
-            folder_name_row,
+            naming_frame,
             from_=8,
             to=MAX_WINDOWS_FILENAME_LENGTH,
             width=6,
             textvariable=self.max_folder_name_length_var,
-        ).pack(side=tk.LEFT, padx=(6, 4))
-        ttk.Label(
-            folder_name_row,
-            text="Used when generating AI folder suggestions.",
-            foreground="#666",
-        ).pack(side=tk.LEFT)
+        ).grid(row=3, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
 
-        hashtag_row = ttk.Frame(top)
-        hashtag_row.grid(row=5, column=2, columnspan=3, sticky="w", padx=8, pady=(8, 0))
         ttk.Checkbutton(
-            hashtag_row,
+            naming_frame,
             text="#️⃣ Include hashtags",
             variable=self.include_hashtags_var,
-        ).pack(side=tk.LEFT)
-        ttk.Label(hashtag_row, text="Count:").pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Spinbox(hashtag_row, from_=1, to=10, width=4, textvariable=self.hashtag_count_var).pack(side=tk.LEFT)
+        ).grid(row=4, column=0, sticky="w", padx=8, pady=(8, 8))
+        ttk.Label(naming_frame, text="Count").grid(row=4, column=1, sticky="e", padx=(0, 4), pady=(8, 8))
+        ttk.Spinbox(naming_frame, from_=1, to=10, width=4, textvariable=self.hashtag_count_var).grid(
+            row=4, column=2, sticky="w", padx=(0, 8), pady=(8, 8)
+        )
         ttk.Label(
-            hashtag_row,
-            text="AI and local post-processing keep tags inside your character limit.",
+            naming_frame,
+            text="Hashtags stay inside your length limit.",
             foreground="#666",
-        ).pack(side=tk.LEFT, padx=8)
+        ).grid(row=4, column=3, sticky="w", padx=(0, 8), pady=(8, 8))
 
-        folder_row = ttk.Frame(top)
-        folder_row.grid(row=2, column=2, columnspan=3, sticky="w", padx=8)
+        # 4) Folder operations section: renaming, restructure, dedupe and cleanup.
+        folder_ops_frame = ttk.LabelFrame(top, text="🗂️ Folder Operations")
+        folder_ops_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        folder_ops_frame.columnconfigure(4, weight=1)
+
         ttk.Checkbutton(
-            folder_row,
+            folder_ops_frame,
             text="Recursive folder categorisation",
             variable=self.recursive_folder_rename_var,
-        ).pack(side=tk.LEFT)
-        ttk.Button(folder_row, text="🗂️ Suggest Folder Names", command=self._start_folder_suggestions).pack(
-            side=tk.LEFT, padx=(10, 4)
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Button(folder_ops_frame, text="🗂️ Suggest Folder Names", command=self._start_folder_suggestions).grid(
+            row=0, column=1, sticky="w", padx=4, pady=(8, 0)
         )
-        ttk.Button(folder_row, text="✅ Apply Folder Renames", command=self._apply_folder_renames).pack(side=tk.LEFT)
+        ttk.Button(folder_ops_frame, text="✅ Apply Folder Renames", command=self._apply_folder_renames).grid(
+            row=0, column=2, sticky="w", padx=4, pady=(8, 0)
+        )
 
-        restructure_row = ttk.Frame(top)
-        restructure_row.grid(row=3, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
         ttk.Checkbutton(
-            restructure_row,
+            folder_ops_frame,
             text="Include subfolders in restructure",
             variable=self.restructure_recursive_var,
-        ).pack(side=tk.LEFT)
+        ).grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Button(
-            restructure_row,
+            folder_ops_frame,
             text="🧭 Suggest Folder Restructure",
             command=self._start_folder_restructure_suggestions,
-        ).pack(side=tk.LEFT, padx=(10, 4))
+        ).grid(row=1, column=1, sticky="w", padx=4, pady=(8, 0))
         ttk.Button(
-            restructure_row,
+            folder_ops_frame,
             text="✅ Apply Folder Restructure",
             command=self._apply_folder_restructure,
-        ).pack(side=tk.LEFT)
+        ).grid(row=1, column=2, sticky="w", padx=4, pady=(8, 0))
         ttk.Label(
-            restructure_row,
-            text="Uses AI to review the full tree and propose consolidated folder/file moves.",
+            folder_ops_frame,
+            text="Reviews the whole tree and proposes grouped destinations.",
             foreground="#666",
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        ).grid(row=1, column=3, columnspan=2, sticky="w", padx=8, pady=(8, 0))
 
-        dedupe_row = ttk.Frame(top)
-        dedupe_row.grid(row=6, column=2, columnspan=3, sticky="w", padx=8, pady=(8, 0))
-        ttk.Label(dedupe_row, text="🧹 Deduplicate:").pack(side=tk.LEFT)
+        ttk.Label(folder_ops_frame, text="Deduplicate").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 8))
         ttk.Combobox(
-            dedupe_row,
+            folder_ops_frame,
             width=16,
             textvariable=self.dedupe_keep_var,
             values=["Keep first match", "Keep last match"],
             state="readonly",
-        ).pack(side=tk.LEFT, padx=(8, 8))
-        ttk.Button(dedupe_row, text="🔁 Find Duplicates", command=self._start_duplicate_scan).pack(side=tk.LEFT)
-        ttk.Button(dedupe_row, text="✅ Apply Deduplication", command=self._apply_deduplication).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(dedupe_row, text="🗑️ Remove Empty Folders", command=self._remove_empty_folders).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(dedupe_row, text="(files + folders)", foreground="#666").pack(side=tk.LEFT, padx=8)
+        ).grid(row=2, column=1, sticky="w", padx=4, pady=(8, 8))
+        ttk.Button(folder_ops_frame, text="🔁 Find Duplicates", command=self._start_duplicate_scan).grid(
+            row=2, column=2, sticky="w", padx=4, pady=(8, 8)
+        )
+        ttk.Button(folder_ops_frame, text="✅ Apply Deduplication", command=self._apply_deduplication).grid(
+            row=2, column=3, sticky="w", padx=4, pady=(8, 8)
+        )
+        ttk.Button(folder_ops_frame, text="🗑️ Remove Empty Folders", command=self._remove_empty_folders).grid(
+            row=2, column=4, sticky="w", padx=4, pady=(8, 8)
+        )
 
         ttk.Label(
             top,
-            text="Tip: Column headers are clickable for sorting. Restructure reviews the whole tree before proposing moves.",
+            text="Tip: click table column headers to sort suggestions before applying actions.",
             foreground="#666",
-        ).grid(row=7, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
-
-        top.columnconfigure(1, weight=1)
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         table_wrapper = ttk.Frame(self, padding=(12, 0, 12, 0))
         table_wrapper.pack(fill=tk.BOTH, expand=True)
@@ -1112,10 +1298,41 @@ class App(tk.Tk):
             self.endpoint_var.set("http://localhost:11434/api/generate")
             self.model_var.set(self.model_var.get() or "llava")
             self.api_entry.configure(state="disabled")
+            self.model_combo.configure(state="normal")
+            self._start_ollama_model_refresh()
         else:
             self.endpoint_var.set("https://api.openai.com/v1/chat/completions")
             self.model_var.set(self.model_var.get() or "gpt-4o-mini")
             self.api_entry.configure(state="normal")
+            self.model_combo.configure(state="normal")
+
+    def _start_ollama_model_refresh(self) -> None:
+        """Load available Ollama models into the model dropdown without blocking the UI."""
+        if not self.provider_mode_var.get().startswith("Local"):
+            return
+
+        self.ui_queue.put(("status", "Fetching available Ollama models..."))
+        worker = threading.Thread(
+            target=self._ollama_model_refresh_worker,
+            args=(self.endpoint_var.get(),),
+            daemon=True,
+        )
+        worker.start()
+
+    def _ollama_model_refresh_worker(self, endpoint: str) -> None:
+        """Fetch model list and publish UI update events."""
+        try:
+            models = fetch_ollama_model_names(endpoint)
+        except Exception as exc:  # noqa: BLE001
+            self.ui_queue.put(("debug", format_debug_event("Ollama model refresh failed", {"error": str(exc)})))
+            self.ui_queue.put(("status", "Could not fetch Ollama models. You can still type a model manually."))
+            return
+
+        self.ui_queue.put(("ollama_models", models))
+        if models:
+            self.ui_queue.put(("status", f"Loaded {len(models)} Ollama model(s) into the dropdown."))
+        else:
+            self.ui_queue.put(("status", "No Ollama models found. Pull a model or type one manually."))
 
     def _select_folder(self) -> None:
         selected = filedialog.askdirectory()
@@ -1340,9 +1557,46 @@ class App(tk.Tk):
             raw_operations = plan.get("operations", []) if isinstance(plan, dict) else []
             operation_rows = raw_operations if isinstance(raw_operations, list) else []
             sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
+
+            missing_sources = find_missing_restructure_sources(
+                suggestions=sanitized,
+                root=folder,
+                candidate_folders=candidate_folders,
+            )
+
+            # Retry once with targeted guidance if the first plan does not cover the full tree.
+            if missing_sources:
+                retry_hint = (
+                    "The previous response missed these source folders: "
+                    f"{json.dumps(missing_sources[:120])}. "
+                    "Return one complete plan that covers the entire folder tree in a single response."
+                )
+                plan = provider.suggest_restructure_plan(
+                    inventory=inventory,
+                    preferences=preferences,
+                    extra_instruction=retry_hint,
+                )
+                raw_operations = plan.get("operations", []) if isinstance(plan, dict) else []
+                operation_rows = raw_operations if isinstance(raw_operations, list) else []
+                sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
+                missing_sources = find_missing_restructure_sources(
+                    suggestions=sanitized,
+                    root=folder,
+                    candidate_folders=candidate_folders,
+                )
         except Exception as exc:  # noqa: BLE001
             self.ui_queue.put(("status", f"Restructure planning failed: {exc}"))
             return
+
+        if missing_sources:
+            self.ui_queue.put(
+                (
+                    "status",
+                    "AI plan is partial. "
+                    f"Covered {len(candidate_folders) - len(missing_sources)}/{len(candidate_folders)} folders. "
+                    "Review suggestions and rerun if needed.",
+                )
+            )
 
         self.folder_structure_suggestions = sanitized
         for idx, proposal in enumerate(self.folder_structure_suggestions, start=1):
@@ -1608,6 +1862,13 @@ class App(tk.Tk):
                 self.folder_row_paths[row_id] = move_rec.source_path
             elif kind == "status":
                 self.status_var.set(msg[1])
+            elif kind == "ollama_models":
+                models: List[str] = msg[1]
+                self.ollama_models = models
+                self.model_combo.configure(values=models)
+                # Keep the current model if valid; otherwise default to the first discovered model.
+                if models and self.model_var.get() not in models:
+                    self.model_var.set(models[0])
             elif kind == "debug":
                 self._append_debug_output(msg[1])
 
