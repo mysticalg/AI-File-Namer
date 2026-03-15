@@ -378,7 +378,11 @@ class AIProvider:
 
 
     def suggest_restructure_plan(self, inventory: Dict[str, object], preferences: FilenamePreferences) -> Dict[str, object]:
-        """Request a full-tree restructure plan so AI can reason across all subfolders at once."""
+        """Request a full-tree folder-only restructure plan.
+
+        The planner works from the root inventory in one pass and returns a complete
+        folder path proposal rather than recursively planning each subtree.
+        """
         import requests
 
         style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
@@ -386,9 +390,13 @@ class AIProvider:
         prompt = (
             "You are organizing a messy folder tree. "
             "Return JSON only with shape: "
-            "{\"operations\": [{\"type\": \"folder|file\", \"source\": \"relative/path\", \"destination\": \"relative/parent/path\"}], "
+            "{\"operations\": [{\"type\": \"folder\", \"source\": \"relative/path\", \"destination\": \"relative/parent/path\"}], "
+            "\"reorganized_structure\": [\"relative/final/folder/path\"], "
             "\"dedupe_files\": true}. "
+            "Only include folder operations, never file operations. "
             "Destination is the target parent path, not final file/folder name. "
+            "The reorganized_structure list must represent the full final folder tree from the root. "
+            "Plan once from the root inventory (do not recursively re-plan each subfolder). "
             "Use shallow logical categories and consolidate duplicates. "
             f"Use {style_description} and {case_description}. "
             "Do not include markdown. "
@@ -518,29 +526,26 @@ def extract_json_object(raw: str) -> Dict[str, object]:
 
 
 def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
-    """Build a compact representation of the current folder structure for AI planning."""
+    """Build a compact folder-only representation for AI restructure planning."""
     folders = collect_subfolders(folder, recursive=recursive)
     max_nodes = 240
     folder_rows: List[Dict[str, object]] = []
     for subfolder in folders[:max_nodes]:
         rel = str(subfolder.relative_to(folder)).replace("\\", "/")
-        files = [child.name for child in sorted(subfolder.iterdir()) if child.is_file()]
+        direct_folders = [child.name for child in sorted(subfolder.iterdir()) if child.is_dir()]
         folder_rows.append(
             {
                 "folder": rel,
-                "direct_file_count": len(files),
-                "sample_files": files[:8],
+                # Keep payload folder-only so restructure prompts stay focused and lightweight.
+                "direct_subfolder_count": len(direct_folders),
+                "sample_subfolders": direct_folders[:8],
             }
         )
 
-    all_files = [p for p in folder.glob("**/*") if p.is_file()] if recursive else [p for p in folder.glob("*") if p.is_file()]
-    file_rows = [str(path.relative_to(folder)).replace("\\", "/") for path in sorted(all_files)[:400]]
     return {
         "root": folder.name,
         "folder_count": len(folders),
-        "file_count": len(all_files),
         "folders": folder_rows,
-        "files": file_rows,
     }
 
 
@@ -563,7 +568,7 @@ def sanitize_restructure_operations(
         source_raw = str(operation.get("source", "")).strip().replace("\\", "/")
         destination_raw = str(operation.get("destination", "")).strip().replace("\\", "/")
         item_type = str(operation.get("type", "folder")).strip().lower()
-        if not source_raw or not destination_raw or item_type not in {"folder", "file"}:
+        if not source_raw or not destination_raw or item_type != "folder":
             continue
 
         source_rel = source_raw.strip("/")

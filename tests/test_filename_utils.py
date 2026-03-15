@@ -18,6 +18,7 @@ from src.ai_file_namer import (
     remove_empty_folders,
     sanitize_category_path,
     sanitize_restructure_operations,
+    build_folder_inventory,
     sanitize_filename_stem,
 )
 
@@ -188,9 +189,48 @@ class FilenameUtilsTests(unittest.TestCase):
             ]
 
             suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
-            self.assertEqual(len(suggestions), 2)
+            self.assertEqual(len(suggestions), 1)
             self.assertEqual(suggestions[0].item_type, "folder")
             self.assertIn("Music", suggestions[0].target_relative)
+
+    def test_sanitize_restructure_operations_ignores_file_operations(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            folder = root / "media"
+            folder.mkdir()
+            (folder / "clip.mp4").write_text("x")
+
+            preferences = FilenamePreferences(
+                separator="_",
+                capitalization="lower",
+                max_filename_length=96,
+                max_folder_name_length=32,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {"type": "file", "source": "media/clip.mp4", "destination": "video/clips"},
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            self.assertEqual(suggestions, [])
+
+    def test_build_folder_inventory_returns_folder_only_payload(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "photos" / "travel").mkdir(parents=True)
+            (root / "photos" / "family").mkdir(parents=True)
+            (root / "photos" / "image1.jpg").write_text("x")
+
+            inventory = build_folder_inventory(root, recursive=True)
+
+            self.assertEqual(inventory["root"], root.name)
+            self.assertNotIn("files", inventory)
+            self.assertNotIn("file_count", inventory)
+            first_row = inventory["folders"][0]
+            self.assertIn("direct_subfolder_count", first_row)
+            self.assertIn("sample_subfolders", first_row)
+            self.assertNotIn("sample_files", first_row)
 
     def test_format_restructure_preview_paths_outputs_old_new_and_transition(self):
         old_path, new_path, transition = format_restructure_preview_paths(
