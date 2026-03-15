@@ -533,6 +533,51 @@ def extract_json_object(raw: str) -> Dict[str, object]:
         return {}
 
 
+def parse_ollama_model_names(payload: Dict[str, object]) -> List[str]:
+    """Extract sorted unique model names from Ollama `/api/tags` payload."""
+    models = payload.get("models", [])
+    if not isinstance(models, list):
+        return []
+
+    canonical_by_lower: Dict[str, str] = {}
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        raw_name = model.get("name")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            continue
+
+        cleaned_name = raw_name.strip()
+        lower_name = cleaned_name.lower()
+        if lower_name not in canonical_by_lower:
+            canonical_by_lower[lower_name] = cleaned_name
+
+    return [canonical_by_lower[key] for key in sorted(canonical_by_lower)]
+
+
+def build_ollama_tags_endpoint(generate_endpoint: str) -> str:
+    """Convert a configured Ollama generate endpoint into a tags endpoint."""
+    base = generate_endpoint.strip() or "http://localhost:11434/api/generate"
+    if "/api/" in base:
+        prefix = base.split("/api/", 1)[0]
+    else:
+        prefix = base.rstrip("/")
+    return f"{prefix}/api/tags"
+
+
+def fetch_ollama_model_names(generate_endpoint: str, timeout_seconds: int = 8) -> List[str]:
+    """Fetch locally available Ollama model names for dropdown selection."""
+    import requests
+
+    tags_endpoint = build_ollama_tags_endpoint(generate_endpoint)
+    response = requests.get(tags_endpoint, timeout=timeout_seconds)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        return []
+    return parse_ollama_model_names(payload)
+
+
 def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
     """Build a compact folder-only representation for AI restructure planning."""
     folders = collect_subfolders(folder, recursive=recursive)
@@ -847,6 +892,7 @@ class App(tk.Tk):
         self.debug_events: List[str] = []
         self.debug_window: Optional[tk.Toplevel] = None
         self.debug_text: Optional[tk.Text] = None
+        self.ollama_models: List[str] = []
 
         self._build_ui()
         self.after(80, self._process_ui_queue)
@@ -888,7 +934,20 @@ class App(tk.Tk):
         ttk.Entry(top, textvariable=self.endpoint_var).grid(row=2, column=1, sticky="ew", padx=8, pady=(10, 0))
 
         ttk.Label(top, text="🧩 Model").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(top, textvariable=self.model_var).grid(row=3, column=1, sticky="ew", padx=8, pady=(10, 0))
+        model_row = ttk.Frame(top)
+        model_row.grid(row=3, column=1, sticky="ew", padx=8, pady=(10, 0))
+        self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var)
+        self.model_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            model_row,
+            text="↻ Fetch Ollama Models",
+            command=self._start_ollama_model_refresh,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(
+            top,
+            text="Tip: for Local mode, refresh to list all installed Ollama models.",
+            foreground="#666",
+        ).grid(row=3, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
 
         ttk.Label(top, text="🔐 API Key").grid(row=4, column=0, sticky="w", pady=(10, 0))
         self.api_entry = ttk.Entry(top, textvariable=self.api_key_var, show="*")
@@ -1139,10 +1198,41 @@ class App(tk.Tk):
             self.endpoint_var.set("http://localhost:11434/api/generate")
             self.model_var.set(self.model_var.get() or "llava")
             self.api_entry.configure(state="disabled")
+            self.model_combo.configure(state="normal")
+            self._start_ollama_model_refresh()
         else:
             self.endpoint_var.set("https://api.openai.com/v1/chat/completions")
             self.model_var.set(self.model_var.get() or "gpt-4o-mini")
             self.api_entry.configure(state="normal")
+            self.model_combo.configure(state="normal")
+
+    def _start_ollama_model_refresh(self) -> None:
+        """Load available Ollama models into the model dropdown without blocking the UI."""
+        if not self.provider_mode_var.get().startswith("Local"):
+            return
+
+        self.ui_queue.put(("status", "Fetching available Ollama models..."))
+        worker = threading.Thread(
+            target=self._ollama_model_refresh_worker,
+            args=(self.endpoint_var.get(),),
+            daemon=True,
+        )
+        worker.start()
+
+    def _ollama_model_refresh_worker(self, endpoint: str) -> None:
+        """Fetch model list and publish UI update events."""
+        try:
+            models = fetch_ollama_model_names(endpoint)
+        except Exception as exc:  # noqa: BLE001
+            self.ui_queue.put(("debug", format_debug_event("Ollama model refresh failed", {"error": str(exc)})))
+            self.ui_queue.put(("status", "Could not fetch Ollama models. You can still type a model manually."))
+            return
+
+        self.ui_queue.put(("ollama_models", models))
+        if models:
+            self.ui_queue.put(("status", f"Loaded {len(models)} Ollama model(s) into the dropdown."))
+        else:
+            self.ui_queue.put(("status", "No Ollama models found. Pull a model or type one manually."))
 
     def _select_folder(self) -> None:
         selected = filedialog.askdirectory()
@@ -1672,6 +1762,13 @@ class App(tk.Tk):
                 self.folder_row_paths[row_id] = move_rec.source_path
             elif kind == "status":
                 self.status_var.set(msg[1])
+            elif kind == "ollama_models":
+                models: List[str] = msg[1]
+                self.ollama_models = models
+                self.model_combo.configure(values=models)
+                # Keep the current model if valid; otherwise default to the first discovered model.
+                if models and self.model_var.get() not in models:
+                    self.model_var.set(models[0])
             elif kind == "debug":
                 self._append_debug_output(msg[1])
 

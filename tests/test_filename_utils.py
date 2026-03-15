@@ -21,6 +21,8 @@ from src.ai_file_namer import (
     build_folder_inventory,
     find_missing_restructure_sources,
     sanitize_filename_stem,
+    build_ollama_tags_endpoint,
+    parse_ollama_model_names,
 )
 
 
@@ -288,6 +290,30 @@ class FilenameUtilsTests(unittest.TestCase):
                 candidate_folders=collect_subfolders(root, recursive=False),
             )
             self.assertEqual(missing, ["videos"])
+
+
+    def test_parse_ollama_model_names_sorts_and_deduplicates(self):
+        payload = {
+            "models": [
+                {"name": "llava"},
+                {"name": "mistral"},
+                {"name": "LLaVA"},
+                {"name": ""},
+                {},
+            ]
+        }
+        names = parse_ollama_model_names(payload)
+        self.assertEqual(names, ["llava", "mistral"])
+
+    def test_build_ollama_tags_endpoint_maps_generate_to_tags(self):
+        self.assertEqual(
+            build_ollama_tags_endpoint("http://localhost:11434/api/generate"),
+            "http://localhost:11434/api/tags",
+        )
+        self.assertEqual(
+            build_ollama_tags_endpoint("http://host:11434/custom"),
+            "http://host:11434/custom/api/tags",
+        )
 
 
 if __name__ == "__main__":
