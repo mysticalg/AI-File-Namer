@@ -10,6 +10,7 @@ from src.ai_file_namer import (
     format_date,
     group_duplicate_files,
     group_duplicate_folders,
+    remove_empty_folders,
     sanitize_filename_stem,
 )
 
@@ -85,6 +86,37 @@ class FilenameUtilsTests(unittest.TestCase):
             groups = group_duplicate_files([a, b, c])
             self.assertEqual(len(groups), 1)
             self.assertEqual({item.name for item in groups[0]}, {"a.jpg", "b.jpg"})
+
+
+    def test_remove_empty_folders_recursive(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            empty_parent = root / "empty_parent"
+            empty_child = empty_parent / "empty_child"
+            non_empty = root / "non_empty"
+            empty_child.mkdir(parents=True)
+            non_empty.mkdir()
+            (non_empty / "keep.txt").write_text("x")
+
+            removed = remove_empty_folders(root, recursive=True)
+
+            self.assertEqual(removed, 2)
+            self.assertFalse(empty_parent.exists())
+            self.assertTrue(non_empty.exists())
+
+    def test_remove_empty_folders_non_recursive(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            top_empty = root / "top_empty"
+            nested = root / "outer" / "inner"
+            top_empty.mkdir()
+            nested.mkdir(parents=True)
+
+            removed = remove_empty_folders(root, recursive=False)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(top_empty.exists())
+            self.assertTrue((root / "outer").exists())
 
     def test_group_duplicate_folders(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
