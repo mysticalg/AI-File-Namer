@@ -1,22 +1,21 @@
-"""Windows-friendly GUI tool for AI-powered file renaming."""
+"""Windows-friendly GUI tool for AI-powered file and folder renaming."""
 from __future__ import annotations
 
 import base64
-import json
-import os
 import queue
 import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".webm", ".mpeg"}
+SUPPORTED_MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 INVALID_FILENAME_CHARS = r'<>:"/\\|?*'
 
 
@@ -37,6 +36,40 @@ class FileSuggestion:
         if self.include_date and self.date_text:
             stem = f"{self.date_text}_{stem}"
         return f"{stem}{self.path.suffix.lower()}"
+
+
+@dataclass
+class FolderSuggestion:
+    """Stores folder rename suggestion for optional recursive folder naming."""
+
+    path: Path
+    suggested_name: str
+
+
+def collect_media_files(folder: Path, recursive: bool) -> List[Path]:
+    """Collect supported media files from a folder.
+
+    Uses deterministic sorting so users get stable scan order across runs.
+    """
+    glob_pattern = "**/*" if recursive else "*"
+    files = [
+        p
+        for p in folder.glob(glob_pattern)
+        if p.is_file() and p.suffix.lower() in SUPPORTED_MEDIA_EXTENSIONS
+    ]
+    return sorted(files)
+
+
+def collect_subfolders(folder: Path, recursive: bool) -> List[Path]:
+    """Collect subfolders to optionally rename with AI."""
+    if recursive:
+        # Deepest-first ordering avoids path invalidation while renaming nested folders.
+        return sorted(
+            [p for p in folder.glob("**/*") if p.is_dir()],
+            key=lambda p: len(p.parts),
+            reverse=True,
+        )
+    return sorted([p for p in folder.iterdir() if p.is_dir()])
 
 
 class AIProvider:
@@ -98,6 +131,42 @@ class AIProvider:
 
         return sanitize_filename_stem(content) or "untitled_media"
 
+    def suggest_folder_name(self, folder_name: str, child_entries: Sequence[str]) -> str:
+        """Suggest a folder name using the folder's visible content labels."""
+        import requests
+
+        listed_items = ", ".join(child_entries[:40]) if child_entries else "empty_folder"
+        prompt = (
+            "Return only a concise snake_case folder name based on these entries. "
+            "No punctuation, no explanation, no markdown. Use 2 to 6 words. "
+            f"Current folder name: {folder_name}. Entries: {listed_items}"
+        )
+
+        if self.mode == "Local (Ollama /api/generate)":
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+            }
+            response = requests.post(self.endpoint, json=payload, timeout=60)
+            response.raise_for_status()
+            content = response.json().get("response", "")
+        else:
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 40,
+            }
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            choices = response.json().get("choices", [])
+            content = choices[0]["message"].get("content", "") if choices else ""
+
+        return sanitize_filename_stem(content) or "untitled_folder"
+
 
 def sanitize_filename_stem(raw: str) -> str:
     """Normalize model response into a Windows-safe snake_case filename stem."""
@@ -155,8 +224,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("AI File Namer")
-        self.geometry("1160x740")
-        self.minsize(980, 620)
+        self.geometry("1180x760")
+        self.minsize(1000, 650)
 
         self.folder_var = tk.StringVar()
         self.provider_mode_var = tk.StringVar(value="Local (Ollama /api/generate)")
@@ -164,11 +233,15 @@ class App(tk.Tk):
         self.model_var = tk.StringVar(value="llava")
         self.api_key_var = tk.StringVar()
         self.include_date_var = tk.BooleanVar(value=False)
+        self.recursive_scan_var = tk.BooleanVar(value=True)
+        self.recursive_folder_rename_var = tk.BooleanVar(value=True)
         self.date_format_var = tk.StringVar(value="%Y-%m-%d")
         self.status_var = tk.StringVar(value="Choose a folder and generate AI suggestions.")
 
         self.suggestions: List[FileSuggestion] = []
+        self.folder_suggestions: List[FolderSuggestion] = []
         self.rename_history: List[Tuple[Path, Path]] = []
+        self.folder_rename_history: List[Tuple[Path, Path]] = []
         self.ui_queue: queue.Queue = queue.Queue()
 
         self._build_ui()
@@ -182,6 +255,19 @@ class App(tk.Tk):
         ttk.Entry(top, textvariable=self.folder_var).grid(row=0, column=1, sticky="ew", padx=8)
         ttk.Button(top, text="Browse", command=self._select_folder).grid(row=0, column=2, padx=4)
         ttk.Button(top, text="Scan + Suggest", command=self._start_scan).grid(row=0, column=3, padx=4)
+
+        option_row = ttk.Frame(top)
+        option_row.grid(row=0, column=4, sticky="w", padx=(8, 0))
+        ttk.Checkbutton(
+            option_row,
+            text="Recursive files",
+            variable=self.recursive_scan_var,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            option_row,
+            text="Looks inside subfolders",
+            foreground="#666",
+        ).pack(side=tk.LEFT, padx=(6, 0))
 
         ttk.Label(top, text="🧠 AI Mode", width=12).grid(row=1, column=0, sticky="w", pady=(10, 0))
         mode_combo = ttk.Combobox(
@@ -204,7 +290,7 @@ class App(tk.Tk):
         self.api_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=(10, 0))
 
         date_row = ttk.Frame(top)
-        date_row.grid(row=1, column=2, columnspan=2, sticky="w", padx=8)
+        date_row.grid(row=1, column=2, columnspan=3, sticky="w", padx=8)
         ttk.Checkbutton(
             date_row,
             text="Include date",
@@ -218,6 +304,24 @@ class App(tk.Tk):
             foreground="#666",
         ).pack(side=tk.LEFT, padx=8)
 
+        folder_row = ttk.Frame(top)
+        folder_row.grid(row=2, column=2, columnspan=3, sticky="w", padx=8)
+        ttk.Checkbutton(
+            folder_row,
+            text="Recursive folder categorisation",
+            variable=self.recursive_folder_rename_var,
+        ).pack(side=tk.LEFT)
+        ttk.Button(folder_row, text="🗂️ Suggest Folder Names", command=self._start_folder_suggestions).pack(
+            side=tk.LEFT, padx=(10, 4)
+        )
+        ttk.Button(folder_row, text="✅ Apply Folder Renames", command=self._apply_folder_renames).pack(side=tk.LEFT)
+
+        ttk.Label(
+            top,
+            text="Tip: Use folder suggestions to build a hierarchy like music_files > midi_files > classical > js_bach.",
+            foreground="#666",
+        ).grid(row=3, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
+
         top.columnconfigure(1, weight=1)
 
         table_wrapper = ttk.Frame(self, padding=(12, 0, 12, 0))
@@ -229,9 +333,9 @@ class App(tk.Tk):
         self.tree.heading("suggestion", text="AI Suggestion")
         self.tree.heading("final", text="Final Filename")
         self.tree.heading("status", text="Status")
-        self.tree.column("original", width=280)
-        self.tree.column("suggestion", width=240)
-        self.tree.column("final", width=300)
+        self.tree.column("original", width=320)
+        self.tree.column("suggestion", width=260)
+        self.tree.column("final", width=320)
         self.tree.column("status", width=120, anchor="center")
 
         yscroll = ttk.Scrollbar(table_wrapper, orient=tk.VERTICAL, command=self.tree.yview)
@@ -247,11 +351,18 @@ class App(tk.Tk):
         ttk.Button(actions, text="🚀 Rename All", command=self._rename_all).pack(side=tk.LEFT, padx=8)
         ttk.Button(actions, text="↩️ Rollback Last Rename", command=self._rollback).pack(side=tk.LEFT)
 
-        ttk.Label(self, textvariable=self.status_var, padding=(12, 0, 12, 12), foreground="#005a9c").pack(
-            anchor="w"
-        )
+        ttk.Label(self, textvariable=self.status_var, padding=(12, 0, 12, 12), foreground="#005a9c").pack(anchor="w")
 
         self._handle_mode_change()
+
+    def _build_provider(self) -> AIProvider:
+        """Construct provider from current UI values."""
+        return AIProvider(
+            mode=self.provider_mode_var.get(),
+            endpoint=self.endpoint_var.get(),
+            model=self.model_var.get(),
+            api_key=self.api_key_var.get(),
+        )
 
     def _handle_mode_change(self) -> None:
         """Adjust defaults and API key availability based on selected provider."""
@@ -280,23 +391,22 @@ class App(tk.Tk):
         self.suggestions.clear()
         self.status_var.set("Collecting files and requesting AI suggestions...")
 
-        worker = threading.Thread(target=self._scan_worker, args=(folder,), daemon=True)
+        worker = threading.Thread(
+            target=self._scan_worker,
+            args=(folder, self.recursive_scan_var.get(), self.include_date_var.get(), self.date_format_var.get()),
+            daemon=True,
+        )
         worker.start()
 
-    def _scan_worker(self, folder: Path) -> None:
-        files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS | VIDEO_EXTENSIONS]
+    def _scan_worker(self, folder: Path, recursive_scan: bool, include_date: bool, date_pattern: str) -> None:
+        files = collect_media_files(folder, recursive_scan)
         if not files:
-            self.ui_queue.put(("status", "No image/video files found in selected folder."))
+            scope = "in selected folder and subfolders" if recursive_scan else "in selected folder"
+            self.ui_queue.put(("status", f"No image/video files found {scope}."))
             return
 
-        provider = AIProvider(
-            mode=self.provider_mode_var.get(),
-            endpoint=self.endpoint_var.get(),
-            model=self.model_var.get(),
-            api_key=self.api_key_var.get(),
-        )
-
-        date_text = format_date(self.date_format_var.get()) if self.include_date_var.get() else ""
+        provider = self._build_provider()
+        date_text = format_date(date_pattern) if include_date else ""
 
         for idx, path in enumerate(files, start=1):
             try:
@@ -304,17 +414,96 @@ class App(tk.Tk):
                 suggestion = provider.suggest_name(media_bytes, path.stem)
                 rec = FileSuggestion(
                     path=path,
-                    original_name=path.name,
+                    original_name=str(path.relative_to(folder)),
                     suggested_name=suggestion,
-                    include_date=self.include_date_var.get(),
+                    include_date=include_date,
                     date_text=date_text,
                 )
                 self.ui_queue.put(("add", rec))
-                self.ui_queue.put(("status", f"Suggested {idx}/{len(files)}: {path.name}"))
+                self.ui_queue.put(("status", f"Suggested {idx}/{len(files)}: {rec.original_name}"))
             except Exception as exc:  # noqa: BLE001
-                self.ui_queue.put(("error_row", path.name, str(exc)))
+                self.ui_queue.put(("error_row", str(path.relative_to(folder)), str(exc)))
 
-        self.ui_queue.put(("status", f"Suggestion complete. {len(files)} files processed."))
+        self.ui_queue.put(("status", f"Suggestion complete. {len(files)} file(s) processed."))
+
+    def _start_folder_suggestions(self) -> None:
+        folder = Path(self.folder_var.get()).expanduser()
+        if not folder.exists() or not folder.is_dir():
+            messagebox.showerror("Invalid folder", "Please choose a valid folder.")
+            return
+
+        self.folder_suggestions.clear()
+        self.status_var.set("Analyzing folders and generating AI folder names...")
+
+        worker = threading.Thread(
+            target=self._folder_suggestion_worker,
+            args=(folder, self.recursive_folder_rename_var.get()),
+            daemon=True,
+        )
+        worker.start()
+
+    def _folder_suggestion_worker(self, folder: Path, recursive_folders: bool) -> None:
+        folders = collect_subfolders(folder, recursive_folders)
+        if not folders:
+            self.ui_queue.put(("status", "No subfolders found to rename."))
+            return
+
+        provider = self._build_provider()
+        for idx, subfolder in enumerate(folders, start=1):
+            try:
+                # Use visible child names as a lightweight semantic summary for the model.
+                child_entries = sorted([child.name for child in subfolder.iterdir()])
+                suggestion = provider.suggest_folder_name(subfolder.name, child_entries)
+                self.folder_suggestions.append(FolderSuggestion(path=subfolder, suggested_name=suggestion))
+                self.ui_queue.put(
+                    (
+                        "status",
+                        f"Folder suggestion {idx}/{len(folders)}: {subfolder.name} -> {suggestion}",
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.ui_queue.put(("status", f"Folder suggestion failed for {subfolder.name}: {exc}"))
+
+        self.ui_queue.put(("status", f"Folder suggestions ready: {len(self.folder_suggestions)} folder(s)."))
+
+    def _apply_folder_renames(self) -> None:
+        if not self.folder_suggestions:
+            messagebox.showinfo(
+                "No folder suggestions",
+                "Run 'Suggest Folder Names' first to prepare AI folder rename suggestions.",
+            )
+            return
+
+        if not messagebox.askyesno(
+            "Confirm folder rename",
+            f"Rename {len(self.folder_suggestions)} folder(s) using AI suggestions?",
+        ):
+            return
+
+        history: List[Tuple[Path, Path]] = []
+        for item in self.folder_suggestions:
+            src = item.path
+            if not src.exists():
+                continue
+
+            dst = src.with_name(item.suggested_name)
+            counter = 1
+            while dst.exists() and dst != src:
+                dst = src.with_name(f"{item.suggested_name}_{counter}")
+                counter += 1
+
+            if dst == src:
+                continue
+
+            try:
+                src.rename(dst)
+                history.append((src, dst))
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("Folder rename failed", f"Failed for {src.name}: {exc}")
+
+        self.folder_rename_history = history
+        self.folder_suggestions.clear()
+        self.status_var.set(f"Folder rename complete: {len(history)} folder(s) renamed.")
 
     def _process_ui_queue(self) -> None:
         while True:
