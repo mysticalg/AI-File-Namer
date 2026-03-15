@@ -20,15 +20,51 @@ from src.ai_file_namer import (
     remove_empty_folders,
     sanitize_category_path,
     sanitize_restructure_operations,
+    normalize_ai_source_relative_path,
+    normalize_ai_destination_relative_path,
     build_folder_inventory,
     find_missing_restructure_sources,
     sanitize_filename_stem,
     build_ollama_tags_endpoint,
     parse_ollama_model_names,
+    load_app_settings,
+    save_app_settings,
+    clamp_ai_timeout_seconds,
 )
 
 
 class FilenameUtilsTests(unittest.TestCase):
+
+    def test_clamp_ai_timeout_seconds_respects_bounds(self):
+        self.assertEqual(clamp_ai_timeout_seconds(120), 120)
+        self.assertEqual(clamp_ai_timeout_seconds(5), 30)
+        self.assertEqual(clamp_ai_timeout_seconds("9999"), 3600)
+        self.assertEqual(clamp_ai_timeout_seconds("bad"), 120)
+
+    def test_load_app_settings_returns_empty_for_missing_or_invalid_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings_path = Path(tmp_dir) / "settings.json"
+            self.assertEqual(load_app_settings(settings_path), {})
+
+            settings_path.write_text("not-json", encoding="utf-8")
+            self.assertEqual(load_app_settings(settings_path), {})
+
+    def test_save_and_load_app_settings_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            settings_path = Path(tmp_dir) / "settings.json"
+            payload = {
+                "provider_mode": "Remote (OpenAI-compatible /v1/chat/completions)",
+                "endpoint": "https://example.test/v1/chat/completions",
+                "recursive_scan": False,
+                "max_filename_length": 88,
+                "ai_timeout_seconds": 240,
+            }
+
+            save_app_settings(payload, settings_path)
+            loaded = load_app_settings(settings_path)
+
+            self.assertEqual(loaded, payload)
+
     def test_sanitize_filename_stem_defaults_to_underscores(self):
         raw = "A Cute Cat!!!\n(indoors)"
         self.assertEqual(sanitize_filename_stem(raw), "a_cute_cat_indoors")
@@ -198,6 +234,75 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertEqual(suggestions[0].item_type, "folder")
             self.assertIn("Music", suggestions[0].target_relative)
 
+    def test_normalize_ai_source_relative_path_strips_root_prefix(self):
+        root = Path("/tmp/Bach")
+        self.assertEqual(normalize_ai_source_relative_path("/Bach/Works", root), "Works")
+        self.assertEqual(normalize_ai_source_relative_path("Bach/Works", root), "Works")
+
+    def test_normalize_ai_destination_relative_path_supports_root_destination(self):
+        root = Path("/tmp/Bach")
+        preferences = FilenamePreferences(
+            separator=" ",
+            capitalization="title",
+            max_filename_length=96,
+            max_folder_name_length=32,
+            include_hashtags=False,
+            hashtag_count=3,
+        )
+        self.assertEqual(normalize_ai_destination_relative_path("/Bach", root, preferences), "")
+        self.assertEqual(normalize_ai_destination_relative_path("", root, preferences), "")
+
+    def test_sanitize_restructure_operations_handles_absolute_and_root_destination(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "Bach"
+            works = root / "Works for Solo Lute"
+            works.mkdir(parents=True)
+
+            preferences = FilenamePreferences(
+                separator=" ",
+                capitalization="title",
+                max_filename_length=96,
+                max_folder_name_length=64,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {"type": "folder", "source": "/Bach/Works for Solo Lute", "destination": "/Bach"},
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            # Root destination is accepted and converted into a valid target path.
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0].original_relative, "Works for Solo Lute")
+            self.assertEqual(suggestions[0].target_relative, "Works For Solo Lute")
+
+    def test_sanitize_restructure_operations_handles_nested_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "Bach"
+            child = root / "Works for Solo Lute" / "Partita in C minor - BWV 997"
+            child.mkdir(parents=True)
+
+            preferences = FilenamePreferences(
+                separator=" ",
+                capitalization="title",
+                max_filename_length=96,
+                max_folder_name_length=64,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {
+                    "type": "folder",
+                    "source": "/Bach/Works for Solo Lute/Partita in C minor - BWV 997",
+                    "destination": "/Bach/Partitas",
+                },
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0].original_relative, "Works for Solo Lute/Partita in C minor - BWV 997")
+            self.assertEqual(suggestions[0].target_relative, "Partitas/Partita In C Minor Bwv 997")
+
     def test_sanitize_restructure_operations_ignores_file_operations(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -230,6 +335,8 @@ class FilenameUtilsTests(unittest.TestCase):
             inventory = build_folder_inventory(root, recursive=True)
 
             self.assertEqual(inventory["root"], root.name)
+            self.assertIn("root_full_path", inventory)
+            self.assertIn("root_parent_name", inventory)
             self.assertNotIn("files", inventory)
             self.assertNotIn("file_count", inventory)
             self.assertIn("all_folder_paths", inventory)

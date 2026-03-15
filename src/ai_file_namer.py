@@ -14,7 +14,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -24,6 +24,55 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".webm", ".mpeg"}
 SUPPORTED_MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 INVALID_FILENAME_CHARS = r'<>:"/\\|?*'
 MAX_WINDOWS_FILENAME_LENGTH = 255
+SETTINGS_FILE_NAME = ".ai_file_namer_settings.json"
+DEFAULT_LOCAL_MODE = "Local (Ollama /api/generate)"
+DEFAULT_REMOTE_MODE = "Remote (OpenAI-compatible /v1/chat/completions)"
+DEFAULT_LOCAL_ENDPOINT = "http://localhost:11434/api/generate"
+DEFAULT_REMOTE_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+DEFAULT_LOCAL_MODEL = "llava"
+DEFAULT_REMOTE_MODEL = "gpt-4o-mini"
+DEFAULT_AI_TIMEOUT_SECONDS = 120
+
+
+def default_settings_path() -> Path:
+    """Return the per-user settings file used to persist UI preferences."""
+    return Path.home() / SETTINGS_FILE_NAME
+
+
+def load_app_settings(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load persisted settings from disk and fail safely on invalid data."""
+    settings_path = path or default_settings_path()
+    if not settings_path.exists():
+        return {}
+    try:
+        loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def save_app_settings(settings: Dict[str, Any], path: Optional[Path] = None) -> None:
+    """Persist app settings so users keep their preferences between sessions."""
+    settings_path = path or default_settings_path()
+    try:
+        settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        # Ignore persistence failures to keep the UI responsive and non-blocking.
+        return
+
+
+def _coerce_int_setting(value: Any, default: int) -> int:
+    """Convert persisted values to int without crashing when settings files are edited manually."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp_ai_timeout_seconds(value: Any) -> int:
+    """Clamp timeout settings to a safe, user-adjustable range."""
+    parsed = _coerce_int_setting(value, DEFAULT_AI_TIMEOUT_SECONDS)
+    return max(30, min(parsed, 3600))
 
 
 @dataclass
@@ -113,12 +162,14 @@ class AIProvider:
         model: str,
         api_key: str = "",
         debug_callback: Optional[Callable[[str], None]] = None,
+        timeout_seconds: int = DEFAULT_AI_TIMEOUT_SECONDS,
     ):
         self.mode = mode
         self.endpoint = endpoint.strip()
         self.model = model.strip()
         self.api_key = api_key.strip()
         self.debug_callback = debug_callback
+        self.timeout_seconds = clamp_ai_timeout_seconds(timeout_seconds)
 
     def _emit_debug(self, title: str, details: Dict[str, object]) -> None:
         """Send structured AI request/response diagnostics to the UI debug log."""
@@ -163,7 +214,7 @@ class AIProvider:
                 "AI request: suggest_name (local)",
                 {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
             )
-            response = requests.post(self.endpoint, json=payload, timeout=60)
+            response = requests.post(self.endpoint, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             content = response_json.get("response", "")
@@ -202,7 +253,7 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             choices = response_json.get("choices", [])
@@ -258,7 +309,7 @@ class AIProvider:
                 "AI request: suggest_folder_name (local)",
                 {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
             )
-            response = requests.post(self.endpoint, json=payload, timeout=60)
+            response = requests.post(self.endpoint, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             content = response_json.get("response", "")
@@ -283,7 +334,7 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             choices = response_json.get("choices", [])
@@ -333,7 +384,7 @@ class AIProvider:
                 "AI request: suggest_folder_structure (local)",
                 {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
             )
-            response = requests.post(self.endpoint, json=payload, timeout=60)
+            response = requests.post(self.endpoint, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             content = response_json.get("response", "")
@@ -358,7 +409,7 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             choices = response_json.get("choices", [])
@@ -394,6 +445,9 @@ class AIProvider:
         case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
         prompt = (
             "You are organizing a messy folder tree. "
+            "Primary goal: consolidate and simplify the tree so it has fewer, clearer folders. "
+            "Use root context (root name, parent name, and full root path) to infer domain and naming intent. "
+            "For example, if context suggests Music/Artist/Bach, expand cryptic catalog labels into meaningful work names when confident. "
             "Return JSON only with shape: "
             "{\"operations\": [{\"type\": \"folder\", \"source\": \"relative/path\", \"destination\": \"relative/parent/path\"}], "
             "\"reorganized_structure\": [\"relative/final/folder/path\"], "
@@ -403,10 +457,13 @@ class AIProvider:
             "The reorganized_structure list must represent the full final folder tree from the root. "
             "Plan once from the root inventory (do not recursively re-plan each subfolder). "
             "Use shallow logical categories and consolidate duplicates. "
+            "Avoid over-nesting and avoid creating one-off folders when an existing shared category works. "
             f"Use {style_description} and {case_description}. "
             "Do not include markdown. "
             "Every source folder should appear exactly once in operations (unless intentionally unchanged). "
             "Group semantically similar folders under shared parent categories. "
+            "When domain appears to be classical music, prefer composer/work hierarchy over opaque codes when possible (e.g., Artist > Work Group > Full Work Title). "
+            "If uncertain, keep existing names rather than inventing facts. "
             f"{extra_instruction} "
             f"Inventory: {json.dumps(inventory)}"
         )
@@ -417,7 +474,7 @@ class AIProvider:
                 "AI request: suggest_restructure_plan (local)",
                 {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
             )
-            response = requests.post(self.endpoint, json=payload, timeout=120)
+            response = requests.post(self.endpoint, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             content = response_json.get("response", "")
@@ -442,7 +499,7 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=120)
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
             choices = response_json.get("choices", [])
@@ -681,6 +738,9 @@ def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
 
     return {
         "root": folder.name,
+        # Include root context so the model can infer domain (e.g., Music/Artists/Bach).
+        "root_full_path": str(folder.resolve()),
+        "root_parent_name": folder.parent.name,
         "folder_count": len(folders),
         # Full path list helps the model return one complete grouped structure in one response.
         "all_folder_paths": folder_paths[:600],
@@ -707,6 +767,35 @@ def format_restructure_preview_paths(original_relative: str, target_relative: st
     return old_path, new_path, transition
 
 
+def normalize_ai_source_relative_path(source_raw: str, root: Path) -> str:
+    """Convert AI `source` values into safe paths relative to the selected root.
+
+    Some models return absolute-style paths (for example `/Bach/...`) or include
+    the selected root name. We normalize those to plain relative paths.
+    """
+    cleaned = source_raw.strip().replace("\\", "/").strip("/")
+    if not cleaned:
+        return ""
+
+    if cleaned == root.name:
+        return ""
+    if cleaned.startswith(f"{root.name}/"):
+        cleaned = cleaned[len(root.name) + 1 :]
+
+    return cleaned.strip("/")
+
+
+def normalize_ai_destination_relative_path(destination_raw: str, root: Path, preferences: FilenamePreferences) -> str:
+    """Convert AI `destination` parent values into safe root-relative paths."""
+    cleaned = destination_raw.strip().replace("\\", "/").strip("/")
+    if not cleaned or cleaned == root.name:
+        return ""
+    if cleaned.startswith(f"{root.name}/"):
+        cleaned = cleaned[len(root.name) + 1 :]
+
+    return sanitize_relative_destination_path(cleaned, preferences)
+
+
 def sanitize_restructure_operations(
     operations: Sequence[Dict[str, object]],
     root: Path,
@@ -718,10 +807,13 @@ def sanitize_restructure_operations(
         source_raw = str(operation.get("source", "")).strip().replace("\\", "/")
         destination_raw = str(operation.get("destination", "")).strip().replace("\\", "/")
         item_type = str(operation.get("type", "folder")).strip().lower()
-        if not source_raw or not destination_raw or item_type != "folder":
+        if not source_raw or item_type != "folder":
             continue
 
-        source_rel = source_raw.strip("/")
+        source_rel = normalize_ai_source_relative_path(source_raw, root)
+        if not source_rel:
+            continue
+
         source_path = (root / source_rel).resolve()
         try:
             source_path.relative_to(root.resolve())
@@ -730,8 +822,12 @@ def sanitize_restructure_operations(
         if not source_path.exists():
             continue
 
-        # destination is a parent path for the source item.
-        sanitized_destination_parent = sanitize_relative_destination_path(destination_raw, preferences)
+        # destination is a parent path for the source item; blank means move to root.
+        sanitized_destination_parent = normalize_ai_destination_relative_path(
+            destination_raw=destination_raw,
+            root=root,
+            preferences=preferences,
+        )
         source_name = sanitize_filename_stem(
             source_path.name,
             separator=preferences.separator,
@@ -740,8 +836,10 @@ def sanitize_restructure_operations(
         )
         if not source_name:
             source_name = source_path.name
-        target_relative = "/".join([part for part in [sanitized_destination_parent, source_name] if part])
-        if not target_relative:
+        target_relative = "/".join([part for part in [sanitized_destination_parent, source_name] if part]) or source_name
+
+        if target_relative.replace("\\", "/").strip("/") == source_rel.replace("\\", "/").strip("/"):
+            # Skip no-op moves so the preview table only shows actionable operations.
             continue
 
         suggestions.append(
@@ -942,25 +1040,35 @@ class App(tk.Tk):
         self.geometry("1180x760")
         self.minsize(1000, 650)
 
-        self.folder_var = tk.StringVar()
-        self.provider_mode_var = tk.StringVar(value="Local (Ollama /api/generate)")
-        self.endpoint_var = tk.StringVar(value="http://localhost:11434/api/generate")
-        self.model_var = tk.StringVar(value="llava")
-        self.api_key_var = tk.StringVar()
-        self.include_date_var = tk.BooleanVar(value=False)
-        self.recursive_scan_var = tk.BooleanVar(value=True)
-        self.recursive_folder_rename_var = tk.BooleanVar(value=True)
-        self.restructure_recursive_var = tk.BooleanVar(value=True)
-        self.date_format_var = tk.StringVar(value="%Y-%m-%d")
+        self.settings_path = default_settings_path()
+        loaded_settings = load_app_settings(self.settings_path)
+
+        self.folder_var = tk.StringVar(value=str(loaded_settings.get("folder", "")))
+        self.provider_mode_var = tk.StringVar(value=str(loaded_settings.get("provider_mode", DEFAULT_LOCAL_MODE)))
+        self.endpoint_var = tk.StringVar(value=str(loaded_settings.get("endpoint", DEFAULT_LOCAL_ENDPOINT)))
+        self.model_var = tk.StringVar(value=str(loaded_settings.get("model", DEFAULT_LOCAL_MODEL)))
+        self.api_key_var = tk.StringVar(value=str(loaded_settings.get("api_key", "")))
+        self.include_date_var = tk.BooleanVar(value=bool(loaded_settings.get("include_date", False)))
+        self.recursive_scan_var = tk.BooleanVar(value=bool(loaded_settings.get("recursive_scan", True)))
+        self.recursive_folder_rename_var = tk.BooleanVar(value=bool(loaded_settings.get("recursive_folder_rename", True)))
+        self.restructure_recursive_var = tk.BooleanVar(value=bool(loaded_settings.get("restructure_recursive", True)))
+        self.date_format_var = tk.StringVar(value=str(loaded_settings.get("date_format", "%Y-%m-%d")))
         # Default to human-readable names as requested: spaces + title case.
-        self.word_separator_var = tk.StringVar(value="White spaces ( )")
-        self.capitalization_var = tk.StringVar(value="Title Case")
-        self.max_filename_length_var = tk.IntVar(value=96)
-        self.max_folder_name_length_var = tk.IntVar(value=96)
-        self.include_hashtags_var = tk.BooleanVar(value=False)
-        self.hashtag_count_var = tk.IntVar(value=3)
-        self.dedupe_keep_var = tk.StringVar(value="Keep first match")
+        self.word_separator_var = tk.StringVar(value=str(loaded_settings.get("word_separator", "White spaces ( )")))
+        self.capitalization_var = tk.StringVar(value=str(loaded_settings.get("capitalization", "Title Case")))
+        self.max_filename_length_var = tk.IntVar(value=_coerce_int_setting(loaded_settings.get("max_filename_length", 96), 96))
+        self.max_folder_name_length_var = tk.IntVar(value=_coerce_int_setting(loaded_settings.get("max_folder_name_length", 96), 96))
+        self.include_hashtags_var = tk.BooleanVar(value=bool(loaded_settings.get("include_hashtags", False)))
+        self.hashtag_count_var = tk.IntVar(value=_coerce_int_setting(loaded_settings.get("hashtag_count", 3), 3))
+        self.dedupe_keep_var = tk.StringVar(value=str(loaded_settings.get("dedupe_keep", "Keep first match")))
+        self.ai_timeout_seconds_var = tk.IntVar(value=clamp_ai_timeout_seconds(loaded_settings.get("ai_timeout_seconds", DEFAULT_AI_TIMEOUT_SECONDS)))
         self.status_var = tk.StringVar(value="Choose a folder and generate AI suggestions.")
+
+        # Store per-provider endpoint/model preferences so mode switches don't erase user values.
+        self.local_endpoint = str(loaded_settings.get("local_endpoint", DEFAULT_LOCAL_ENDPOINT))
+        self.remote_endpoint = str(loaded_settings.get("remote_endpoint", DEFAULT_REMOTE_ENDPOINT))
+        self.local_model = str(loaded_settings.get("local_model", DEFAULT_LOCAL_MODEL))
+        self.remote_model = str(loaded_settings.get("remote_model", DEFAULT_REMOTE_MODEL))
 
         self.suggestions: List[FileSuggestion] = []
         self.folder_suggestions: List[FolderSuggestion] = []
@@ -976,8 +1084,13 @@ class App(tk.Tk):
         self.debug_window: Optional[tk.Toplevel] = None
         self.debug_text: Optional[tk.Text] = None
         self.ollama_models: List[str] = []
+        self._settings_ready = False
 
         self._build_ui()
+        self._register_settings_traces()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._settings_ready = True
+        self._save_settings()
         self.after(80, self._process_ui_queue)
 
     def _build_ui(self) -> None:
@@ -1043,11 +1156,21 @@ class App(tk.Tk):
         self.api_entry = ttk.Entry(ai_frame, textvariable=self.api_key_var, show="*")
         self.api_entry.grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
 
+        ttk.Label(ai_frame, text="⏱️ AI timeout (sec)").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Spinbox(
+            ai_frame,
+            from_=30,
+            to=3600,
+            increment=30,
+            textvariable=self.ai_timeout_seconds_var,
+            width=10,
+        ).grid(row=4, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+
         ttk.Label(
             ai_frame,
-            text="Tip: Local mode can auto-load installed Ollama models.",
+            text="Tip: Default is 120s. Increase this for slower models or large media inputs.",
             foreground="#666",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
 
         # 3) Naming section: filename/folder conventions together for predictability.
         naming_frame = ttk.LabelFrame(top, text="✍️ Naming Rules")
@@ -1224,6 +1347,79 @@ class App(tk.Tk):
 
         self._handle_mode_change()
 
+    def _capture_provider_fields_for_mode(self) -> None:
+        """Store endpoint/model values for the currently selected provider mode."""
+        if self.provider_mode_var.get().startswith("Local"):
+            self.local_endpoint = self.endpoint_var.get().strip() or DEFAULT_LOCAL_ENDPOINT
+            self.local_model = self.model_var.get().strip() or DEFAULT_LOCAL_MODEL
+        else:
+            self.remote_endpoint = self.endpoint_var.get().strip() or DEFAULT_REMOTE_ENDPOINT
+            self.remote_model = self.model_var.get().strip() or DEFAULT_REMOTE_MODEL
+
+    def _settings_snapshot(self) -> Dict[str, Any]:
+        """Collect all user-facing controls into one persisted settings object."""
+        self._capture_provider_fields_for_mode()
+        return {
+            "folder": self.folder_var.get(),
+            "provider_mode": self.provider_mode_var.get(),
+            "endpoint": self.endpoint_var.get(),
+            "model": self.model_var.get(),
+            "api_key": self.api_key_var.get(),
+            "include_date": self.include_date_var.get(),
+            "recursive_scan": self.recursive_scan_var.get(),
+            "recursive_folder_rename": self.recursive_folder_rename_var.get(),
+            "restructure_recursive": self.restructure_recursive_var.get(),
+            "date_format": self.date_format_var.get(),
+            "word_separator": self.word_separator_var.get(),
+            "capitalization": self.capitalization_var.get(),
+            "max_filename_length": self.max_filename_length_var.get(),
+            "max_folder_name_length": self.max_folder_name_length_var.get(),
+            "include_hashtags": self.include_hashtags_var.get(),
+            "hashtag_count": self.hashtag_count_var.get(),
+            "dedupe_keep": self.dedupe_keep_var.get(),
+            "ai_timeout_seconds": clamp_ai_timeout_seconds(self.ai_timeout_seconds_var.get()),
+            "local_endpoint": self.local_endpoint,
+            "remote_endpoint": self.remote_endpoint,
+            "local_model": self.local_model,
+            "remote_model": self.remote_model,
+        }
+
+    def _save_settings(self, *_: object) -> None:
+        """Persist settings after UI changes so relaunch restores the full workspace state."""
+        if not self._settings_ready:
+            return
+        save_app_settings(self._settings_snapshot(), self.settings_path)
+
+    def _register_settings_traces(self) -> None:
+        """Attach variable traces so every control change is automatically persisted."""
+        tracked_vars = [
+            self.folder_var,
+            self.provider_mode_var,
+            self.endpoint_var,
+            self.model_var,
+            self.api_key_var,
+            self.include_date_var,
+            self.recursive_scan_var,
+            self.recursive_folder_rename_var,
+            self.restructure_recursive_var,
+            self.date_format_var,
+            self.word_separator_var,
+            self.capitalization_var,
+            self.max_filename_length_var,
+            self.max_folder_name_length_var,
+            self.include_hashtags_var,
+            self.hashtag_count_var,
+            self.dedupe_keep_var,
+            self.ai_timeout_seconds_var,
+        ]
+        for variable in tracked_vars:
+            variable.trace_add("write", self._save_settings)
+
+    def _on_close(self) -> None:
+        """Save settings and close app."""
+        self._save_settings()
+        self.destroy()
+
     def _build_provider(self) -> AIProvider:
         """Construct provider from current UI values."""
         return AIProvider(
@@ -1232,6 +1428,7 @@ class App(tk.Tk):
             model=self.model_var.get(),
             api_key=self.api_key_var.get(),
             debug_callback=self._queue_debug_event,
+            timeout_seconds=clamp_ai_timeout_seconds(self.ai_timeout_seconds_var.get()),
         )
 
     def _queue_debug_event(self, message: str) -> None:
@@ -1293,16 +1490,19 @@ class App(tk.Tk):
 
     def _handle_mode_change(self) -> None:
         """Adjust defaults and API key availability based on selected provider."""
+        self._capture_provider_fields_for_mode()
         mode = self.provider_mode_var.get()
         if mode.startswith("Local"):
-            self.endpoint_var.set("http://localhost:11434/api/generate")
-            self.model_var.set(self.model_var.get() or "llava")
+            # Keep the user's local endpoint/model choices instead of resetting each toggle.
+            self.endpoint_var.set(self.local_endpoint or DEFAULT_LOCAL_ENDPOINT)
+            self.model_var.set(self.local_model or DEFAULT_LOCAL_MODEL)
             self.api_entry.configure(state="disabled")
             self.model_combo.configure(state="normal")
             self._start_ollama_model_refresh()
         else:
-            self.endpoint_var.set("https://api.openai.com/v1/chat/completions")
-            self.model_var.set(self.model_var.get() or "gpt-4o-mini")
+            # Keep the user's remote endpoint/model choices instead of resetting each toggle.
+            self.endpoint_var.set(self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT)
+            self.model_var.set(self.remote_model or DEFAULT_REMOTE_MODEL)
             self.api_entry.configure(state="normal")
             self.model_combo.configure(state="normal")
 
@@ -1557,6 +1757,14 @@ class App(tk.Tk):
             raw_operations = plan.get("operations", []) if isinstance(plan, dict) else []
             operation_rows = raw_operations if isinstance(raw_operations, list) else []
             sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
+            if operation_rows and not sanitized:
+                self.ui_queue.put(
+                    (
+                        "status",
+                        "AI returned operations, but none were actionable after sanitization. "
+                        "Try rerunning with a different model or adjust naming settings.",
+                    )
+                )
 
             missing_sources = find_missing_restructure_sources(
                 suggestions=sanitized,
@@ -1569,7 +1777,8 @@ class App(tk.Tk):
                 retry_hint = (
                     "The previous response missed these source folders: "
                     f"{json.dumps(missing_sources[:120])}. "
-                    "Return one complete plan that covers the entire folder tree in a single response."
+                    "Return one complete plan that covers the entire folder tree in a single response, "
+                    "while still prioritizing consolidation into fewer, clearer categories."
                 )
                 plan = provider.suggest_restructure_plan(
                     inventory=inventory,
