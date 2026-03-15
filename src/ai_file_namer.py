@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import queue
 import re
+import subprocess
+import sys
 import shutil
 import threading
 from dataclasses import dataclass
@@ -29,6 +32,7 @@ class FilenamePreferences:
     separator: str
     capitalization: str
     max_filename_length: int
+    max_folder_name_length: int
     include_hashtags: bool
     hashtag_count: int
 
@@ -225,7 +229,7 @@ class AIProvider:
                 content,
                 separator=preferences.separator,
                 capitalization=preferences.capitalization,
-                max_length=preferences.max_filename_length,
+                max_length=preferences.max_folder_name_length,
             )
             or "untitled_folder"
         )
@@ -351,6 +355,26 @@ def group_duplicate_folders(folders: Sequence[Path]) -> List[List[Path]]:
     return [sorted(group) for group in buckets.values() if len(group) > 1]
 
 
+def remove_empty_folders(folder: Path, recursive: bool = True) -> int:
+    """Delete empty subfolders and return how many were removed.
+
+    Traversal is deepest-first so child directories are removed before parents.
+    The selected root folder itself is intentionally preserved.
+    """
+    folders = collect_subfolders(folder, recursive=recursive)
+    removed_count = 0
+    for candidate in folders:
+        if not candidate.exists() or not candidate.is_dir():
+            continue
+        try:
+            candidate.rmdir()
+            removed_count += 1
+        except OSError:
+            # Non-empty or inaccessible folders are skipped to keep cleanup robust.
+            continue
+    return removed_count
+
+
 def format_date(pattern: str) -> str:
     """Return formatted date string (defaults to YYYY-MM-DD on invalid pattern)."""
     try:
@@ -410,6 +434,7 @@ class App(tk.Tk):
         self.word_separator_var = tk.StringVar(value="Underscores (_)")
         self.capitalization_var = tk.StringVar(value="lowercase")
         self.max_filename_length_var = tk.IntVar(value=96)
+        self.max_folder_name_length_var = tk.IntVar(value=96)
         self.include_hashtags_var = tk.BooleanVar(value=False)
         self.hashtag_count_var = tk.IntVar(value=3)
         self.dedupe_keep_var = tk.StringVar(value="Keep first match")
@@ -422,6 +447,7 @@ class App(tk.Tk):
         self.rename_history: List[Tuple[Path, Path]] = []
         self.folder_rename_history: List[Tuple[Path, Path]] = []
         self.ui_queue: queue.Queue = queue.Queue()
+        self.folder_row_paths: Dict[str, Path] = {}
 
         self._build_ui()
         self.after(80, self._process_ui_queue)
@@ -511,6 +537,22 @@ class App(tk.Tk):
         ).pack(side=tk.LEFT, padx=(6, 4))
         ttk.Label(naming_row, text="(includes date + extension)", foreground="#666").pack(side=tk.LEFT)
 
+        folder_name_row = ttk.Frame(top)
+        folder_name_row.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(folder_name_row, text="📁 Max folder name length:").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            folder_name_row,
+            from_=8,
+            to=MAX_WINDOWS_FILENAME_LENGTH,
+            width=6,
+            textvariable=self.max_folder_name_length_var,
+        ).pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Label(
+            folder_name_row,
+            text="Used when generating AI folder suggestions.",
+            foreground="#666",
+        ).pack(side=tk.LEFT)
+
         hashtag_row = ttk.Frame(top)
         hashtag_row.grid(row=5, column=2, columnspan=3, sticky="w", padx=8, pady=(8, 0))
         ttk.Checkbutton(
@@ -550,6 +592,7 @@ class App(tk.Tk):
         ).pack(side=tk.LEFT, padx=(8, 8))
         ttk.Button(dedupe_row, text="🔁 Find Duplicates", command=self._start_duplicate_scan).pack(side=tk.LEFT)
         ttk.Button(dedupe_row, text="✅ Apply Deduplication", command=self._apply_deduplication).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(dedupe_row, text="🗑️ Remove Empty Folders", command=self._remove_empty_folders).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(dedupe_row, text="(files + folders)", foreground="#666").pack(side=tk.LEFT, padx=8)
 
         ttk.Label(
@@ -577,6 +620,13 @@ class App(tk.Tk):
         yscroll = ttk.Scrollbar(table_wrapper, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=yscroll.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
+        # Right-click menu for folder suggestion rows for quick OS navigation/actions.
+        self.folder_menu = tk.Menu(self, tearoff=0)
+        self.folder_menu.add_command(
+            label="📂 Open Folder in Explorer",
+            command=self._open_selected_folder_in_explorer,
+        )
+        self.tree.bind("<Button-3>", self._show_row_context_menu)
         yscroll.grid(row=0, column=1, sticky="ns")
         table_wrapper.columnconfigure(0, weight=1)
         table_wrapper.rowconfigure(0, weight=1)
@@ -650,6 +700,11 @@ class App(tk.Tk):
             chosen_length = 96
         max_length = max(1, min(chosen_length, MAX_WINDOWS_FILENAME_LENGTH))
         try:
+            chosen_folder_length = int(self.max_folder_name_length_var.get())
+        except (TypeError, tk.TclError, ValueError):
+            chosen_folder_length = 96
+        max_folder_length = max(1, min(chosen_folder_length, MAX_WINDOWS_FILENAME_LENGTH))
+        try:
             hashtag_raw = int(self.hashtag_count_var.get())
         except (TypeError, tk.TclError, ValueError):
             hashtag_raw = 3
@@ -658,6 +713,7 @@ class App(tk.Tk):
             separator=separator,
             capitalization=capitalization,
             max_filename_length=max_length,
+            max_folder_name_length=max_folder_length,
             include_hashtags=self.include_hashtags_var.get(),
             hashtag_count=hashtag_count,
         )
@@ -712,6 +768,7 @@ class App(tk.Tk):
             return
 
         self.folder_suggestions.clear()
+        self.folder_row_paths.clear()
         # Clear and repurpose the output grid so users can review folder names before applying.
         self.tree.delete(*self.tree.get_children())
         self.status_var.set("Analyzing folders and generating AI folder names...")
@@ -878,6 +935,50 @@ class App(tk.Tk):
             f"Deduplication complete: removed {file_removed} duplicate files and {folder_removed} duplicate folders."
         )
 
+    def _show_row_context_menu(self, event: tk.Event) -> None:
+        """Show context menu on folder suggestion rows for quick OS folder access."""
+        row_id = self.tree.identify_row(event.y)
+        if not row_id or row_id not in self.folder_row_paths:
+            return
+        self.tree.selection_set(row_id)
+        self.folder_menu.tk_popup(event.x_root, event.y_root)
+
+    def _open_selected_folder_in_explorer(self) -> None:
+        """Open the currently selected folder suggestion in the OS file explorer."""
+        selected = self.tree.selection()
+        if not selected:
+            return
+        folder_path = self.folder_row_paths.get(selected[0])
+        if not folder_path or not folder_path.exists():
+            messagebox.showwarning("Folder missing", "The selected folder no longer exists.")
+            return
+
+        try:
+            if os.name == "nt":
+                os.startfile(folder_path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(folder_path)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(folder_path)], check=False)
+            self.status_var.set(f"Opened folder: {folder_path}")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Open folder failed", f"Could not open folder: {exc}")
+
+    def _remove_empty_folders(self) -> None:
+        """Remove empty folders inside the selected path after confirmation."""
+        folder = Path(self.folder_var.get()).expanduser()
+        if not folder.exists() or not folder.is_dir():
+            messagebox.showerror("Invalid folder", "Please choose a valid folder.")
+            return
+        if not messagebox.askyesno(
+            "Confirm empty-folder cleanup",
+            "Remove all empty folders in the selected directory tree?",
+        ):
+            return
+
+        removed = remove_empty_folders(folder, recursive=True)
+        self.status_var.set(f"Empty-folder cleanup complete: removed {removed} folder(s).")
+
     def _process_ui_queue(self) -> None:
         while True:
             try:
@@ -896,11 +997,13 @@ class App(tk.Tk):
             elif kind == "folder_add":
                 folder_rec: FolderSuggestion = msg[1]
                 # Reuse the same output table so folder rename previews are visible before apply.
-                self.tree.insert(
+                row_id = self.tree.insert(
                     "",
                     tk.END,
                     values=(folder_rec.original_name, folder_rec.suggested_name, folder_rec.suggested_name, "Folder Ready"),
                 )
+                # Keep exact paths for right-click Explorer actions.
+                self.folder_row_paths[row_id] = folder_rec.path
             elif kind == "status":
                 self.status_var.set(msg[1])
 
