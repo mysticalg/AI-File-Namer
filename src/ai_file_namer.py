@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import queue
 import re
@@ -68,11 +69,12 @@ class FolderSuggestion:
 
 @dataclass
 class FolderStructureSuggestion:
-    """Stores a proposed folder move to build a cleaner directory hierarchy."""
+    """Stores a proposed move to build a cleaner directory hierarchy."""
 
     source_path: Path
     original_relative: str
     target_relative: str
+    item_type: str = "folder"
 
 
 def collect_media_files(folder: Path, recursive: bool) -> List[Path]:
@@ -295,6 +297,46 @@ class AIProvider:
         )
 
 
+    def suggest_restructure_plan(self, inventory: Dict[str, object], preferences: FilenamePreferences) -> Dict[str, object]:
+        """Request a full-tree restructure plan so AI can reason across all subfolders at once."""
+        import requests
+
+        style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
+        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        prompt = (
+            "You are organizing a messy folder tree. "
+            "Return JSON only with shape: "
+            "{\"operations\": [{\"type\": \"folder|file\", \"source\": \"relative/path\", \"destination\": \"relative/parent/path\"}], "
+            "\"dedupe_files\": true}. "
+            "Destination is the target parent path, not final file/folder name. "
+            "Use shallow logical categories and consolidate duplicates. "
+            f"Use {style_description} and {case_description}. "
+            "Do not include markdown. "
+            f"Inventory: {json.dumps(inventory)}"
+        )
+
+        if self.mode == "Local (Ollama /api/generate)":
+            payload = {"model": self.model, "prompt": prompt, "stream": False}
+            response = requests.post(self.endpoint, json=payload, timeout=120)
+            response.raise_for_status()
+            content = response.json().get("response", "")
+        else:
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 900,
+            }
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=120)
+            response.raise_for_status()
+            choices = response.json().get("choices", [])
+            content = choices[0]["message"].get("content", "") if choices else ""
+
+        return extract_json_object(content)
+
+
 def sanitize_category_path(
     raw: str,
     separator: str,
@@ -317,6 +359,107 @@ def sanitize_category_path(
         if len(cleaned_parts) >= max(1, max_depth):
             break
     return "/".join(cleaned_parts)
+
+
+def sanitize_relative_destination_path(raw: str, preferences: FilenamePreferences, max_depth: int = 6) -> str:
+    """Normalize AI destination paths for files/folders and keep them safely relative."""
+    cleaned = sanitize_category_path(
+        raw=raw,
+        separator=preferences.separator,
+        capitalization=preferences.capitalization,
+        max_segment_length=preferences.max_folder_name_length,
+        max_depth=max_depth,
+    )
+    return cleaned.strip("/")
+
+
+def extract_json_object(raw: str) -> Dict[str, object]:
+    """Extract first JSON object from model output to tolerate extra prose/markdown."""
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {}
+    snippet = raw[start : end + 1]
+    try:
+        parsed = json.loads(snippet)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
+    """Build a compact representation of the current folder structure for AI planning."""
+    folders = collect_subfolders(folder, recursive=recursive)
+    max_nodes = 240
+    folder_rows: List[Dict[str, object]] = []
+    for subfolder in folders[:max_nodes]:
+        rel = str(subfolder.relative_to(folder)).replace("\\", "/")
+        files = [child.name for child in sorted(subfolder.iterdir()) if child.is_file()]
+        folder_rows.append(
+            {
+                "folder": rel,
+                "direct_file_count": len(files),
+                "sample_files": files[:8],
+            }
+        )
+
+    all_files = [p for p in folder.glob("**/*") if p.is_file()] if recursive else [p for p in folder.glob("*") if p.is_file()]
+    file_rows = [str(path.relative_to(folder)).replace("\\", "/") for path in sorted(all_files)[:400]]
+    return {
+        "root": folder.name,
+        "folder_count": len(folders),
+        "file_count": len(all_files),
+        "folders": folder_rows,
+        "files": file_rows,
+    }
+
+
+def sanitize_restructure_operations(
+    operations: Sequence[Dict[str, object]],
+    root: Path,
+    preferences: FilenamePreferences,
+) -> List[FolderStructureSuggestion]:
+    """Validate and sanitize AI-proposed operations into executable move suggestions."""
+    suggestions: List[FolderStructureSuggestion] = []
+    for operation in operations:
+        source_raw = str(operation.get("source", "")).strip().replace("\\", "/")
+        destination_raw = str(operation.get("destination", "")).strip().replace("\\", "/")
+        item_type = str(operation.get("type", "folder")).strip().lower()
+        if not source_raw or not destination_raw or item_type not in {"folder", "file"}:
+            continue
+
+        source_rel = source_raw.strip("/")
+        source_path = (root / source_rel).resolve()
+        try:
+            source_path.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if not source_path.exists():
+            continue
+
+        # destination is a parent path for the source item.
+        sanitized_destination_parent = sanitize_relative_destination_path(destination_raw, preferences)
+        source_name = sanitize_filename_stem(
+            source_path.name,
+            separator=preferences.separator,
+            capitalization=preferences.capitalization,
+            max_length=preferences.max_folder_name_length,
+        )
+        if not source_name:
+            source_name = source_path.name
+        target_relative = "/".join([part for part in [sanitized_destination_parent, source_name] if part])
+        if not target_relative:
+            continue
+
+        suggestions.append(
+            FolderStructureSuggestion(
+                source_path=source_path,
+                original_relative=source_rel,
+                target_relative=target_relative,
+                item_type=item_type,
+            )
+        )
+    return suggestions
 
 
 def sanitize_filename_stem(
@@ -535,6 +678,7 @@ class App(tk.Tk):
         self.folder_rename_history: List[Tuple[Path, Path]] = []
         self.ui_queue: queue.Queue = queue.Queue()
         self.folder_row_paths: Dict[str, Path] = {}
+        self.sort_state: Dict[str, bool] = {}
 
         self._build_ui()
         self.after(80, self._process_ui_queue)
@@ -686,7 +830,7 @@ class App(tk.Tk):
         ).pack(side=tk.LEFT)
         ttk.Label(
             restructure_row,
-            text="Uses AI to group existing folders into a cleaner hierarchy.",
+            text="Uses AI to review the full tree and propose consolidated folder/file moves.",
             foreground="#666",
         ).pack(side=tk.LEFT, padx=(8, 0))
 
@@ -707,7 +851,7 @@ class App(tk.Tk):
 
         ttk.Label(
             top,
-            text="Tip: Use folder suggestions for names, then use restructure to consolidate messy folder trees.",
+            text="Tip: Column headers are clickable for sorting. Restructure reviews the whole tree before proposing moves.",
             foreground="#666",
         ).grid(row=7, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
 
@@ -718,10 +862,11 @@ class App(tk.Tk):
 
         cols = ("original", "suggestion", "final", "status")
         self.tree = ttk.Treeview(table_wrapper, columns=cols, show="headings", selectmode="extended")
-        self.tree.heading("original", text="Original")
-        self.tree.heading("suggestion", text="AI Suggestion")
-        self.tree.heading("final", text="Final Filename")
-        self.tree.heading("status", text="Status")
+        # Clickable column headers for quick sorting while reviewing AI suggestions.
+        self.tree.heading("original", text="Original", command=lambda: self._sort_tree_by_column("original"))
+        self.tree.heading("suggestion", text="AI Suggestion", command=lambda: self._sort_tree_by_column("suggestion"))
+        self.tree.heading("final", text="Final Filename", command=lambda: self._sort_tree_by_column("final"))
+        self.tree.heading("status", text="Status", command=lambda: self._sort_tree_by_column("status"))
         self.tree.column("original", width=320)
         self.tree.column("suggestion", width=260)
         self.tree.column("final", width=320)
@@ -972,7 +1117,7 @@ class App(tk.Tk):
         self.folder_structure_suggestions.clear()
         self.folder_row_paths.clear()
         self.tree.delete(*self.tree.get_children())
-        self.status_var.set("Analyzing folder hierarchy and proposing a logical restructure...")
+        self.status_var.set("Analyzing the full folder tree and building an AI restructure plan...")
 
         worker = threading.Thread(
             target=self._folder_restructure_worker,
@@ -982,53 +1127,66 @@ class App(tk.Tk):
         worker.start()
 
     def _folder_restructure_worker(self, folder: Path, recursive_folders: bool, preferences: FilenamePreferences) -> None:
-        """Generate suggested destination category paths for subfolders."""
+        """Generate a whole-tree AI restructure plan and sanitize it into executable moves."""
         candidate_folders = collect_subfolders(folder, recursive_folders)
         if not candidate_folders:
             self.ui_queue.put(("status", "No subfolders found to restructure."))
             return
 
         provider = self._build_provider()
-        for idx, subfolder in enumerate(candidate_folders, start=1):
-            try:
-                child_entries = sorted([child.name for child in subfolder.iterdir()])
-                target_relative = provider.suggest_folder_structure(subfolder.name, child_entries, preferences)
-                if not target_relative:
-                    continue
+        try:
+            inventory = build_folder_inventory(folder, recursive=recursive_folders)
+            plan = provider.suggest_restructure_plan(inventory=inventory, preferences=preferences)
+            raw_operations = plan.get("operations", []) if isinstance(plan, dict) else []
+            operation_rows = raw_operations if isinstance(raw_operations, list) else []
+            sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
+        except Exception as exc:  # noqa: BLE001
+            self.ui_queue.put(("status", f"Restructure planning failed: {exc}"))
+            return
 
-                proposal = FolderStructureSuggestion(
-                    source_path=subfolder,
-                    original_relative=str(subfolder.relative_to(folder)),
-                    target_relative=f"{target_relative}/{subfolder.name}",
-                )
-                self.folder_structure_suggestions.append(proposal)
-                self.ui_queue.put(("restructure_add", proposal))
-                self.ui_queue.put(
-                    ("status", f"Restructure suggestion {idx}/{len(candidate_folders)}: {proposal.original_relative}"),
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.ui_queue.put(("status", f"Restructure suggestion failed for {subfolder.name}: {exc}"))
+        self.folder_structure_suggestions = sanitized
+        for idx, proposal in enumerate(self.folder_structure_suggestions, start=1):
+            self.ui_queue.put(("restructure_add", proposal))
+            self.ui_queue.put(
+                ("status", f"Restructure suggestion {idx}/{len(self.folder_structure_suggestions)}: {proposal.original_relative}"),
+            )
+
+        dedupe_requested = bool(plan.get("dedupe_files", True)) if isinstance(plan, dict) else True
+        if dedupe_requested:
+            self.ui_queue.put(("status", "AI plan requests duplicate-file cleanup after restructure."))
 
         self.ui_queue.put(
-            ("status", f"Restructure suggestions ready: {len(self.folder_structure_suggestions)} folder(s)."),
+            (
+                "status",
+                f"Restructure suggestions ready: {len(self.folder_structure_suggestions)} operation(s). Click column headers to sort.",
+            )
         )
 
     def _apply_folder_restructure(self) -> None:
-        """Apply proposed folder moves to create a cleaner category hierarchy."""
+        """Apply AI-planned moves for folders/files, then remove duplicate files for cleanup."""
         if not self.folder_structure_suggestions:
             messagebox.showinfo("No restructure suggestions", "Run 'Suggest Folder Restructure' first.")
             return
 
         if not messagebox.askyesno(
             "Confirm folder restructure",
-            f"Move {len(self.folder_structure_suggestions)} folder(s) into AI-suggested categories?",
+            f"Apply {len(self.folder_structure_suggestions)} move operation(s) and clean duplicate files?",
         ):
             return
 
-        root = Path(self.folder_var.get()).expanduser()
-        moved_count = 0
+        root = Path(self.folder_var.get()).expanduser().resolve()
+        moved_folders = 0
+        moved_files = 0
         skipped_count = 0
-        for proposal in self.folder_structure_suggestions:
+
+        # Apply deepest items first so parent moves do not invalidate child paths mid-run.
+        ordered_moves = sorted(
+            self.folder_structure_suggestions,
+            key=lambda item: len(item.source_path.parts),
+            reverse=True,
+        )
+
+        for proposal in ordered_moves:
             src = proposal.source_path
             if not src.exists():
                 skipped_count += 1
@@ -1042,7 +1200,7 @@ class App(tk.Tk):
             destination = root.joinpath(*relative_parts)
             if destination == src:
                 continue
-            if str(destination).startswith(str(src) + os.sep):
+            if proposal.item_type == "folder" and str(destination).startswith(str(src) + os.sep):
                 skipped_count += 1
                 continue
 
@@ -1055,13 +1213,30 @@ class App(tk.Tk):
 
             try:
                 src.rename(candidate_destination)
-                moved_count += 1
+                if proposal.item_type == "file":
+                    moved_files += 1
+                else:
+                    moved_folders += 1
             except OSError:
                 skipped_count += 1
 
+        # Final tidy-up: remove exact duplicate files by content hash across the selected tree.
+        all_files = [path for path in root.glob("**/*") if path.is_file()]
+        duplicate_groups = group_duplicate_files(all_files)
+        duplicate_removed = 0
+        for group in duplicate_groups:
+            for duplicate in sorted(group)[1:]:
+                try:
+                    duplicate.unlink()
+                    duplicate_removed += 1
+                except OSError:
+                    continue
+
         self.folder_structure_suggestions.clear()
         self.status_var.set(
-            f"Folder restructure complete: moved {moved_count} folder(s), skipped {skipped_count}."
+            "Folder restructure complete: "
+            f"moved {moved_folders} folder(s), moved {moved_files} file(s), "
+            f"removed {duplicate_removed} duplicate file(s), skipped {skipped_count}."
         )
 
     def _start_duplicate_scan(self) -> None:
@@ -1223,13 +1398,27 @@ class App(tk.Tk):
                 row_id = self.tree.insert(
                     "",
                     tk.END,
-                    values=(move_rec.original_relative, move_rec.target_relative, move_rec.target_relative, "Move Ready"),
+                    values=(move_rec.original_relative, move_rec.target_relative, move_rec.target_relative, f"{move_rec.item_type.title()} Move"),
                 )
                 self.folder_row_paths[row_id] = move_rec.source_path
             elif kind == "status":
                 self.status_var.set(msg[1])
 
         self.after(80, self._process_ui_queue)
+
+    def _sort_tree_by_column(self, column_name: str) -> None:
+        """Sort current tree rows by the selected column and toggle asc/desc each click."""
+        row_ids = list(self.tree.get_children(""))
+        if not row_ids:
+            return
+
+        # Keep sorting lightweight with case-insensitive string comparison.
+        reverse = self.sort_state.get(column_name, False)
+        sorted_rows = sorted(row_ids, key=lambda row_id: str(self.tree.set(row_id, column_name)).lower(), reverse=reverse)
+        for index, row_id in enumerate(sorted_rows):
+            self.tree.move(row_id, "", index)
+
+        self.sort_state[column_name] = not reverse
 
     def _rename_indices(self, indices: Iterable[int]) -> None:
         rename_pairs: List[Tuple[Path, Path]] = []

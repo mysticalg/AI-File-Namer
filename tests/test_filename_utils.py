@@ -10,8 +10,11 @@ from src.ai_file_namer import (
     format_date,
     group_duplicate_files,
     group_duplicate_folders,
+    FilenamePreferences,
+    extract_json_object,
     remove_empty_folders,
     sanitize_category_path,
+    sanitize_restructure_operations,
     sanitize_filename_stem,
 )
 
@@ -152,6 +155,39 @@ class FilenameUtilsTests(unittest.TestCase):
             max_depth=3,
         )
         self.assertEqual(path, "Personal Photos/Travel Shots")
+
+    def test_extract_json_object_reads_wrapped_json(self):
+        payload = "```json\n{\"operations\": [], \"dedupe_files\": true}\n```"
+        result = extract_json_object(payload)
+        self.assertIn("operations", result)
+        self.assertTrue(result.get("dedupe_files"))
+
+    def test_sanitize_restructure_operations_filters_invalid_entries(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            folder = root / "messy folder"
+            folder.mkdir()
+            file_path = folder / "track 01.mp3"
+            file_path.write_text("x")
+
+            preferences = FilenamePreferences(
+                separator=" ",
+                capitalization="title",
+                max_filename_length=96,
+                max_folder_name_length=32,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {"type": "folder", "source": "messy folder", "destination": "Music/Archive"},
+                {"type": "file", "source": "messy folder/track 01.mp3", "destination": "Music/Singles"},
+                {"type": "folder", "source": "../escape", "destination": "Bad"},
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            self.assertEqual(len(suggestions), 2)
+            self.assertEqual(suggestions[0].item_type, "folder")
+            self.assertIn("Music", suggestions[0].target_relative)
 
 
 if __name__ == "__main__":
