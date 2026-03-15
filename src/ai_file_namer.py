@@ -17,6 +17,16 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".webm", ".mpeg"}
 SUPPORTED_MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 INVALID_FILENAME_CHARS = r'<>:"/\\|?*'
+MAX_WINDOWS_FILENAME_LENGTH = 255
+
+
+@dataclass
+class FilenamePreferences:
+    """User-configurable naming preferences applied to model output."""
+
+    separator: str
+    capitalization: str
+    max_filename_length: int
 
 
 @dataclass
@@ -28,13 +38,14 @@ class FileSuggestion:
     suggested_name: str
     include_date: bool
     date_text: str
+    date_separator: str = "_"
 
     @property
     def final_name(self) -> str:
         """Build final filename with extension and optional date prefix."""
         stem = self.suggested_name
         if self.include_date and self.date_text:
-            stem = f"{self.date_text}_{stem}"
+            stem = f"{self.date_text}{self.date_separator}{stem}"
         return f"{stem}{self.path.suffix.lower()}"
 
 
@@ -81,14 +92,24 @@ class AIProvider:
         self.model = model.strip()
         self.api_key = api_key.strip()
 
-    def suggest_name(self, image_bytes: bytes, filename_hint: str) -> str:
+    def suggest_name(
+        self,
+        image_bytes: bytes,
+        filename_hint: str,
+        target_stem_length: int,
+        preferences: FilenamePreferences,
+    ) -> str:
         """Send image bytes to configured AI and return a safe filename stem."""
         import requests
 
+        style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
+        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
         prompt = (
-            "Return only a concise snake_case filename stem for this media. "
-            "No extension, punctuation, markdown, or explanation. "
-            "Use 3 to 8 words max."
+            "Return only a filename stem for this media. "
+            f"Use {style_description} and {case_description}. "
+            "No extension, no punctuation, no markdown, no explanation. "
+            "Use descriptive wording and try to use the full allowed length. "
+            f"Target stem length: {target_stem_length} characters."
         )
 
         if self.mode == "Local (Ollama /api/generate)":
@@ -129,7 +150,12 @@ class AIProvider:
             choices = response.json().get("choices", [])
             content = choices[0]["message"]["content"] if choices else ""
 
-        return sanitize_filename_stem(content) or "untitled_media"
+        return sanitize_filename_stem(
+            content,
+            separator=preferences.separator,
+            capitalization=preferences.capitalization,
+            max_length=target_stem_length,
+        ) or "untitled_media"
 
     def suggest_folder_name(self, folder_name: str, child_entries: Sequence[str]) -> str:
         """Suggest a folder name using the folder's visible content labels."""
@@ -168,16 +194,47 @@ class AIProvider:
         return sanitize_filename_stem(content) or "untitled_folder"
 
 
-def sanitize_filename_stem(raw: str) -> str:
-    """Normalize model response into a Windows-safe snake_case filename stem."""
+def sanitize_filename_stem(
+    raw: str,
+    separator: str = "_",
+    capitalization: str = "lower",
+    max_length: int = 96,
+) -> str:
+    """Normalize model response into a Windows-safe filename stem.
+
+    The returned value honors user preferences for separators/capitalization and
+    trims to the requested maximum character count.
+    """
     cleaned = raw.strip().lower()
     cleaned = re.sub(r"[`'\"\n\r]", " ", cleaned)
     cleaned = re.sub(r"[^a-z0-9_\-\s]", " ", cleaned)
     cleaned = cleaned.replace("-", " ")
-    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = re.sub(r"\s+", separator, cleaned)
     cleaned = cleaned.strip(" _.")
     cleaned = "".join(ch for ch in cleaned if ch not in INVALID_FILENAME_CHARS)
-    return cleaned[:96]
+    if capitalization == "title":
+        # Preserve chosen separator while capitalizing each token for readability.
+        tokens = [token.capitalize() for token in cleaned.split(separator) if token]
+        cleaned = separator.join(tokens)
+    return cleaned[:max(1, max_length)]
+
+
+def compute_target_stem_length(
+    path: Path,
+    include_date: bool,
+    date_text: str,
+    max_filename_length: int,
+    date_separator: str = "_",
+) -> int:
+    """Compute stem budget so total filename length stays inside the user limit.
+
+    Total length includes stem + optional date prefix + extension.
+    """
+    extension = path.suffix.lower()
+    date_prefix = f"{date_text}{date_separator}" if include_date and date_text else ""
+    overhead_length = len(extension) + len(date_prefix)
+    safe_total = max(1, min(max_filename_length, MAX_WINDOWS_FILENAME_LENGTH))
+    return max(1, safe_total - overhead_length)
 
 
 def format_date(pattern: str) -> str:
@@ -236,6 +293,9 @@ class App(tk.Tk):
         self.recursive_scan_var = tk.BooleanVar(value=True)
         self.recursive_folder_rename_var = tk.BooleanVar(value=True)
         self.date_format_var = tk.StringVar(value="%Y-%m-%d")
+        self.word_separator_var = tk.StringVar(value="Underscores (_)")
+        self.capitalization_var = tk.StringVar(value="lowercase")
+        self.max_filename_length_var = tk.IntVar(value=96)
         self.status_var = tk.StringVar(value="Choose a folder and generate AI suggestions.")
 
         self.suggestions: List[FileSuggestion] = []
@@ -303,6 +363,34 @@ class App(tk.Tk):
             text="(strftime, e.g. %Y-%m-%d)",
             foreground="#666",
         ).pack(side=tk.LEFT, padx=8)
+
+        naming_row = ttk.Frame(top)
+        naming_row.grid(row=4, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
+        ttk.Label(naming_row, text="🧰 Separator:").pack(side=tk.LEFT)
+        ttk.Combobox(
+            naming_row,
+            width=18,
+            textvariable=self.word_separator_var,
+            state="readonly",
+            values=["Underscores (_)", "White spaces ( )"],
+        ).pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Label(naming_row, text="🔠 Case:").pack(side=tk.LEFT)
+        ttk.Combobox(
+            naming_row,
+            width=12,
+            textvariable=self.capitalization_var,
+            state="readonly",
+            values=["lowercase", "Title Case"],
+        ).pack(side=tk.LEFT, padx=(6, 10))
+        ttk.Label(naming_row, text="📏 Max filename length:").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            naming_row,
+            from_=16,
+            to=MAX_WINDOWS_FILENAME_LENGTH,
+            width=6,
+            textvariable=self.max_filename_length_var,
+        ).pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Label(naming_row, text="(includes date + extension)", foreground="#666").pack(side=tk.LEFT)
 
         folder_row = ttk.Frame(top)
         folder_row.grid(row=2, column=2, columnspan=3, sticky="w", padx=8)
@@ -393,12 +481,40 @@ class App(tk.Tk):
 
         worker = threading.Thread(
             target=self._scan_worker,
-            args=(folder, self.recursive_scan_var.get(), self.include_date_var.get(), self.date_format_var.get()),
+            args=(
+                folder,
+                self.recursive_scan_var.get(),
+                self.include_date_var.get(),
+                self.date_format_var.get(),
+                self._current_preferences(),
+            ),
             daemon=True,
         )
         worker.start()
 
-    def _scan_worker(self, folder: Path, recursive_scan: bool, include_date: bool, date_pattern: str) -> None:
+    def _current_preferences(self) -> FilenamePreferences:
+        """Read and normalize naming preferences from the UI."""
+        separator = " " if self.word_separator_var.get().startswith("White spaces") else "_"
+        capitalization = "title" if self.capitalization_var.get() == "Title Case" else "lower"
+        try:
+            chosen_length = int(self.max_filename_length_var.get())
+        except (TypeError, tk.TclError, ValueError):
+            chosen_length = 96
+        max_length = max(1, min(chosen_length, MAX_WINDOWS_FILENAME_LENGTH))
+        return FilenamePreferences(
+            separator=separator,
+            capitalization=capitalization,
+            max_filename_length=max_length,
+        )
+
+    def _scan_worker(
+        self,
+        folder: Path,
+        recursive_scan: bool,
+        include_date: bool,
+        date_pattern: str,
+        preferences: FilenamePreferences,
+    ) -> None:
         files = collect_media_files(folder, recursive_scan)
         if not files:
             scope = "in selected folder and subfolders" if recursive_scan else "in selected folder"
@@ -411,13 +527,21 @@ class App(tk.Tk):
         for idx, path in enumerate(files, start=1):
             try:
                 media_bytes = extract_video_first_frame(path) if path.suffix.lower() in VIDEO_EXTENSIONS else load_image_bytes(path)
-                suggestion = provider.suggest_name(media_bytes, path.stem)
+                target_stem_length = compute_target_stem_length(
+                    path=path,
+                    include_date=include_date,
+                    date_text=date_text,
+                    max_filename_length=preferences.max_filename_length,
+                    date_separator=preferences.separator,
+                )
+                suggestion = provider.suggest_name(media_bytes, path.stem, target_stem_length, preferences)
                 rec = FileSuggestion(
                     path=path,
                     original_name=str(path.relative_to(folder)),
                     suggested_name=suggestion,
                     include_date=include_date,
                     date_text=date_text,
+                    date_separator=preferences.separator,
                 )
                 self.ui_queue.put(("add", rec))
                 self.ui_queue.put(("status", f"Suggested {idx}/{len(files)}: {rec.original_name}"))
