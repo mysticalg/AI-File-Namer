@@ -58,6 +58,7 @@ class FolderSuggestion:
     """Stores folder rename suggestion for optional recursive folder naming."""
 
     path: Path
+    original_name: str
     suggested_name: str
 
 
@@ -177,13 +178,21 @@ class AIProvider:
 
         return stem
 
-    def suggest_folder_name(self, folder_name: str, child_entries: Sequence[str]) -> str:
+    def suggest_folder_name(
+        self,
+        folder_name: str,
+        child_entries: Sequence[str],
+        preferences: FilenamePreferences,
+    ) -> str:
         """Suggest a folder name using the folder's visible content labels."""
         import requests
 
         listed_items = ", ".join(child_entries[:40]) if child_entries else "empty_folder"
+        style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
+        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
         prompt = (
-            "Return only a concise snake_case folder name based on these entries. "
+            "Return only a concise folder name based on these entries. "
+            f"Use {style_description} and {case_description}. "
             "No punctuation, no explanation, no markdown. Use 2 to 6 words. "
             f"Current folder name: {folder_name}. Entries: {listed_items}"
         )
@@ -211,7 +220,15 @@ class AIProvider:
             choices = response.json().get("choices", [])
             content = choices[0]["message"].get("content", "") if choices else ""
 
-        return sanitize_filename_stem(content) or "untitled_folder"
+        return (
+            sanitize_filename_stem(
+                content,
+                separator=preferences.separator,
+                capitalization=preferences.capitalization,
+                max_length=preferences.max_filename_length,
+            )
+            or "untitled_folder"
+        )
 
 
 def sanitize_filename_stem(
@@ -695,16 +712,18 @@ class App(tk.Tk):
             return
 
         self.folder_suggestions.clear()
+        # Clear and repurpose the output grid so users can review folder names before applying.
+        self.tree.delete(*self.tree.get_children())
         self.status_var.set("Analyzing folders and generating AI folder names...")
 
         worker = threading.Thread(
             target=self._folder_suggestion_worker,
-            args=(folder, self.recursive_folder_rename_var.get()),
+            args=(folder, self.recursive_folder_rename_var.get(), self._current_preferences()),
             daemon=True,
         )
         worker.start()
 
-    def _folder_suggestion_worker(self, folder: Path, recursive_folders: bool) -> None:
+    def _folder_suggestion_worker(self, folder: Path, recursive_folders: bool, preferences: FilenamePreferences) -> None:
         folders = collect_subfolders(folder, recursive_folders)
         if not folders:
             self.ui_queue.put(("status", "No subfolders found to rename."))
@@ -715,8 +734,14 @@ class App(tk.Tk):
             try:
                 # Use visible child names as a lightweight semantic summary for the model.
                 child_entries = sorted([child.name for child in subfolder.iterdir()])
-                suggestion = provider.suggest_folder_name(subfolder.name, child_entries)
-                self.folder_suggestions.append(FolderSuggestion(path=subfolder, suggested_name=suggestion))
+                suggestion = provider.suggest_folder_name(subfolder.name, child_entries, preferences)
+                record = FolderSuggestion(
+                    path=subfolder,
+                    original_name=str(subfolder.relative_to(folder)),
+                    suggested_name=suggestion,
+                )
+                self.folder_suggestions.append(record)
+                self.ui_queue.put(("folder_add", record))
                 self.ui_queue.put(
                     (
                         "status",
@@ -743,6 +768,7 @@ class App(tk.Tk):
             return
 
         history: List[Tuple[Path, Path]] = []
+        separator = self._current_preferences().separator
         for item in self.folder_suggestions:
             src = item.path
             if not src.exists():
@@ -751,7 +777,7 @@ class App(tk.Tk):
             dst = src.with_name(item.suggested_name)
             counter = 1
             while dst.exists() and dst != src:
-                dst = src.with_name(f"{item.suggested_name}_{counter}")
+                dst = src.with_name(f"{item.suggested_name}{separator}{counter}")
                 counter += 1
 
             if dst == src:
@@ -867,6 +893,14 @@ class App(tk.Tk):
             elif kind == "error_row":
                 original_name, error_text = msg[1], msg[2]
                 self.tree.insert("", tk.END, values=(original_name, "", "", f"Error: {error_text}"))
+            elif kind == "folder_add":
+                folder_rec: FolderSuggestion = msg[1]
+                # Reuse the same output table so folder rename previews are visible before apply.
+                self.tree.insert(
+                    "",
+                    tk.END,
+                    values=(folder_rec.original_name, folder_rec.suggested_name, folder_rec.suggested_name, "Folder Ready"),
+                )
             elif kind == "status":
                 self.status_var.set(msg[1])
 
