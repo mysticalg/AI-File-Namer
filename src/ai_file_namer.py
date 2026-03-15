@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import queue
 import re
@@ -13,7 +14,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -66,6 +67,15 @@ class FolderSuggestion:
     suggested_name: str
 
 
+@dataclass
+class FolderStructureSuggestion:
+    """Stores a proposed move to build a cleaner directory hierarchy."""
+
+    source_path: Path
+    original_relative: str
+    target_relative: str
+
+
 def collect_media_files(folder: Path, recursive: bool) -> List[Path]:
     """Collect supported media files from a folder.
 
@@ -95,11 +105,25 @@ def collect_subfolders(folder: Path, recursive: bool) -> List[Path]:
 class AIProvider:
     """Simple AI provider abstraction supporting local and remote HTTP APIs."""
 
-    def __init__(self, mode: str, endpoint: str, model: str, api_key: str = ""):
+    def __init__(
+        self,
+        mode: str,
+        endpoint: str,
+        model: str,
+        api_key: str = "",
+        debug_callback: Optional[Callable[[str], None]] = None,
+    ):
         self.mode = mode
         self.endpoint = endpoint.strip()
         self.model = model.strip()
         self.api_key = api_key.strip()
+        self.debug_callback = debug_callback
+
+    def _emit_debug(self, title: str, details: Dict[str, object]) -> None:
+        """Send structured AI request/response diagnostics to the UI debug log."""
+        if not self.debug_callback:
+            return
+        self.debug_callback(format_debug_event(title, details))
 
     def suggest_name(
         self,
@@ -134,9 +158,18 @@ class AIProvider:
                 "images": [base64.b64encode(image_bytes).decode("utf-8")],
                 "stream": False,
             }
+            self._emit_debug(
+                "AI request: suggest_name (local)",
+                {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
+            )
             response = requests.post(self.endpoint, json=payload, timeout=60)
             response.raise_for_status()
-            content = response.json().get("response", "")
+            response_json = response.json()
+            content = response_json.get("response", "")
+            self._emit_debug(
+                "AI response: suggest_name (local)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
         else:
             headers = {"Content-Type": "application/json"}
             if self.api_key:
@@ -160,10 +193,23 @@ class AIProvider:
                 ],
                 "max_tokens": 50,
             }
+            self._emit_debug(
+                "AI request: suggest_name (remote)",
+                {
+                    "endpoint": self.endpoint,
+                    "headers": summarize_debug_headers(headers),
+                    "payload": summarize_debug_payload(payload),
+                },
+            )
             response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
-            choices = response.json().get("choices", [])
+            response_json = response.json()
+            choices = response_json.get("choices", [])
             content = choices[0]["message"]["content"] if choices else ""
+            self._emit_debug(
+                "AI response: suggest_name (remote)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
 
         stem = sanitize_filename_stem(
             content,
@@ -207,9 +253,18 @@ class AIProvider:
                 "prompt": prompt,
                 "stream": False,
             }
+            self._emit_debug(
+                "AI request: suggest_folder_name (local)",
+                {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
+            )
             response = requests.post(self.endpoint, json=payload, timeout=60)
             response.raise_for_status()
-            content = response.json().get("response", "")
+            response_json = response.json()
+            content = response_json.get("response", "")
+            self._emit_debug(
+                "AI response: suggest_folder_name (local)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
         else:
             headers = {"Content-Type": "application/json"}
             if self.api_key:
@@ -219,10 +274,23 @@ class AIProvider:
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 40,
             }
+            self._emit_debug(
+                "AI request: suggest_folder_name (remote)",
+                {
+                    "endpoint": self.endpoint,
+                    "headers": summarize_debug_headers(headers),
+                    "payload": summarize_debug_payload(payload),
+                },
+            )
             response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
-            choices = response.json().get("choices", [])
+            response_json = response.json()
+            choices = response_json.get("choices", [])
             content = choices[0]["message"].get("content", "") if choices else ""
+            self._emit_debug(
+                "AI response: suggest_folder_name (remote)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
 
         return (
             sanitize_filename_stem(
@@ -233,6 +301,275 @@ class AIProvider:
             )
             or "untitled_folder"
         )
+
+    def suggest_folder_structure(
+        self,
+        folder_name: str,
+        child_entries: Sequence[str],
+        preferences: FilenamePreferences,
+    ) -> str:
+        """Suggest a logical category path for a folder, like `photos/travel`."""
+        import requests
+
+        listed_items = ", ".join(child_entries[:40]) if child_entries else "empty_folder"
+        style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
+        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        prompt = (
+            "Return only a category path for organizing this folder. "
+            "Use 1 to 3 path segments separated by '/'. "
+            f"Use {style_description} and {case_description}. "
+            "No punctuation outside path separators. No explanation. "
+            f"Folder name: {folder_name}. Entries: {listed_items}"
+        )
+
+        if self.mode == "Local (Ollama /api/generate)":
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+            }
+            self._emit_debug(
+                "AI request: suggest_folder_structure (local)",
+                {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
+            )
+            response = requests.post(self.endpoint, json=payload, timeout=60)
+            response.raise_for_status()
+            response_json = response.json()
+            content = response_json.get("response", "")
+            self._emit_debug(
+                "AI response: suggest_folder_structure (local)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
+        else:
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 40,
+            }
+            self._emit_debug(
+                "AI request: suggest_folder_structure (remote)",
+                {
+                    "endpoint": self.endpoint,
+                    "headers": summarize_debug_headers(headers),
+                    "payload": summarize_debug_payload(payload),
+                },
+            )
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            response_json = response.json()
+            choices = response_json.get("choices", [])
+            content = choices[0]["message"].get("content", "") if choices else ""
+            self._emit_debug(
+                "AI response: suggest_folder_structure (remote)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
+
+        return sanitize_category_path(
+            raw=content,
+            separator=preferences.separator,
+            capitalization=preferences.capitalization,
+            max_segment_length=preferences.max_folder_name_length,
+            max_depth=3,
+        )
+
+
+    def suggest_restructure_plan(self, inventory: Dict[str, object], preferences: FilenamePreferences) -> Dict[str, object]:
+        """Request a full-tree restructure plan so AI can reason across all subfolders at once."""
+        import requests
+
+        style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
+        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        prompt = (
+            "You are organizing a messy folder tree. "
+            "Return JSON only with shape: "
+            "{\"folders\": [{\"source\": \"relative/current/path\", \"destination\": \"relative/new/path\"}]}. "
+            "Include all folders that should move so the whole structure is reorganized from the selected root. "
+            "Do not include files. Only folder paths rooted at the selected root folder. "
+            "Each destination is the full new relative folder path. "
+            f"Use {style_description} and {case_description}. "
+            "Do not include markdown. "
+            f"Inventory: {json.dumps(inventory)}"
+        )
+
+        if self.mode == "Local (Ollama /api/generate)":
+            payload = {"model": self.model, "prompt": prompt, "stream": False}
+            self._emit_debug(
+                "AI request: suggest_restructure_plan (local)",
+                {"endpoint": self.endpoint, "payload": summarize_debug_payload(payload)},
+            )
+            response = requests.post(self.endpoint, json=payload, timeout=120)
+            response.raise_for_status()
+            response_json = response.json()
+            content = response_json.get("response", "")
+            self._emit_debug(
+                "AI response: suggest_restructure_plan (local)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
+        else:
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 900,
+            }
+            self._emit_debug(
+                "AI request: suggest_restructure_plan (remote)",
+                {
+                    "endpoint": self.endpoint,
+                    "headers": summarize_debug_headers(headers),
+                    "payload": summarize_debug_payload(payload),
+                },
+            )
+            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=120)
+            response.raise_for_status()
+            response_json = response.json()
+            choices = response_json.get("choices", [])
+            content = choices[0]["message"].get("content", "") if choices else ""
+            self._emit_debug(
+                "AI response: suggest_restructure_plan (remote)",
+                {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
+            )
+
+        return extract_json_object(content)
+
+
+def summarize_debug_payload(payload: object, max_chars: int = 4000) -> str:
+    """Serialize payloads compactly for debug display and cap size for UI responsiveness."""
+    try:
+        serialized = json.dumps(payload, indent=2, ensure_ascii=False)
+    except TypeError:
+        serialized = str(payload)
+
+    if len(serialized) <= max_chars:
+        return serialized
+    return f"{serialized[:max_chars]}... [truncated {len(serialized) - max_chars} chars]"
+
+
+def summarize_debug_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    """Redact secrets in debug headers while keeping request context visible."""
+    redacted = dict(headers)
+    auth_value = redacted.get("Authorization")
+    if auth_value:
+        redacted["Authorization"] = "Bearer ***redacted***"
+    return redacted
+
+
+def format_debug_event(title: str, details: Dict[str, object]) -> str:
+    """Build a timestamped debug event line block for the debug output window."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    body = summarize_debug_payload(details, max_chars=5000)
+    return f"[{timestamp}] {title}\n{body}\n\n"
+
+
+def sanitize_category_path(
+    raw: str,
+    separator: str,
+    capitalization: str,
+    max_segment_length: int,
+    max_depth: int = 3,
+) -> str:
+    """Normalize model output into a safe, shallow folder category path."""
+    parts = re.split(r"[\\/>|]+", raw)
+    cleaned_parts: List[str] = []
+    for part in parts:
+        cleaned = sanitize_filename_stem(
+            part,
+            separator=separator,
+            capitalization=capitalization,
+            max_length=max_segment_length,
+        )
+        if cleaned:
+            cleaned_parts.append(cleaned)
+        if len(cleaned_parts) >= max(1, max_depth):
+            break
+    return "/".join(cleaned_parts)
+
+
+def sanitize_relative_destination_path(raw: str, preferences: FilenamePreferences, max_depth: int = 6) -> str:
+    """Normalize AI destination paths for files/folders and keep them safely relative."""
+    cleaned = sanitize_category_path(
+        raw=raw,
+        separator=preferences.separator,
+        capitalization=preferences.capitalization,
+        max_segment_length=preferences.max_folder_name_length,
+        max_depth=max_depth,
+    )
+    return cleaned.strip("/")
+
+
+def extract_json_object(raw: str) -> Dict[str, object]:
+    """Extract first JSON object from model output to tolerate extra prose/markdown."""
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {}
+    snippet = raw[start : end + 1]
+    try:
+        parsed = json.loads(snippet)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
+    """Build a compact folder-only tree representation for whole-root AI planning."""
+    folders = collect_subfolders(folder, recursive=recursive)
+    folder_paths = [str(subfolder.relative_to(folder)).replace("\\", "/") for subfolder in folders[:400]]
+    return {
+        "root_folder": folder.name,
+        "folder_count": len(folders),
+        "folders": folder_paths,
+    }
+
+
+def format_restructure_preview_paths(original_relative: str, target_relative: str) -> Tuple[str, str, str]:
+    """Build readable old/new preview strings for restructure rows in the results table."""
+    old_path = original_relative.replace("\\", "/").strip("/") or "."
+    new_path = target_relative.replace("\\", "/").strip("/") or "."
+    transition = f"{old_path} → {new_path}"
+    return old_path, new_path, transition
+
+
+def sanitize_restructure_operations(
+    operations: Sequence[Dict[str, object]],
+    root: Path,
+    preferences: FilenamePreferences,
+) -> List[FolderStructureSuggestion]:
+    """Validate and sanitize AI folder-move operations into executable suggestions."""
+    suggestions: List[FolderStructureSuggestion] = []
+    for operation in operations:
+        source_raw = str(operation.get("source", "")).strip().replace("\\", "/")
+        destination_raw = str(operation.get("destination", "")).strip().replace("\\", "/")
+        if not source_raw or not destination_raw:
+            continue
+
+        source_rel = source_raw.strip("/")
+        source_path = (root / source_rel).resolve()
+        try:
+            source_path.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if not source_path.exists() or not source_path.is_dir():
+            continue
+
+        # destination is the full new relative folder path under the selected root.
+        sanitized_destination = sanitize_relative_destination_path(destination_raw, preferences)
+        if not sanitized_destination:
+            continue
+
+        suggestions.append(
+            FolderStructureSuggestion(
+                source_path=source_path,
+                original_relative=source_rel,
+                target_relative=sanitized_destination,
+            )
+        )
+    return suggestions
 
 
 def sanitize_filename_stem(
@@ -430,9 +767,11 @@ class App(tk.Tk):
         self.include_date_var = tk.BooleanVar(value=False)
         self.recursive_scan_var = tk.BooleanVar(value=True)
         self.recursive_folder_rename_var = tk.BooleanVar(value=True)
+        self.restructure_recursive_var = tk.BooleanVar(value=True)
         self.date_format_var = tk.StringVar(value="%Y-%m-%d")
-        self.word_separator_var = tk.StringVar(value="Underscores (_)")
-        self.capitalization_var = tk.StringVar(value="lowercase")
+        # Default to human-readable names as requested: spaces + title case.
+        self.word_separator_var = tk.StringVar(value="White spaces ( )")
+        self.capitalization_var = tk.StringVar(value="Title Case")
         self.max_filename_length_var = tk.IntVar(value=96)
         self.max_folder_name_length_var = tk.IntVar(value=96)
         self.include_hashtags_var = tk.BooleanVar(value=False)
@@ -442,12 +781,17 @@ class App(tk.Tk):
 
         self.suggestions: List[FileSuggestion] = []
         self.folder_suggestions: List[FolderSuggestion] = []
+        self.folder_structure_suggestions: List[FolderStructureSuggestion] = []
         self.duplicate_file_groups: List[List[Path]] = []
         self.duplicate_folder_groups: List[List[Path]] = []
         self.rename_history: List[Tuple[Path, Path]] = []
         self.folder_rename_history: List[Tuple[Path, Path]] = []
         self.ui_queue: queue.Queue = queue.Queue()
         self.folder_row_paths: Dict[str, Path] = {}
+        self.sort_state: Dict[str, bool] = {}
+        self.debug_events: List[str] = []
+        self.debug_window: Optional[tk.Toplevel] = None
+        self.debug_text: Optional[tk.Text] = None
 
         self._build_ui()
         self.after(80, self._process_ui_queue)
@@ -460,6 +804,7 @@ class App(tk.Tk):
         ttk.Entry(top, textvariable=self.folder_var).grid(row=0, column=1, sticky="ew", padx=8)
         ttk.Button(top, text="Browse", command=self._select_folder).grid(row=0, column=2, padx=4)
         ttk.Button(top, text="Scan + Suggest", command=self._start_scan).grid(row=0, column=3, padx=4)
+        ttk.Button(top, text="🪵 AI Debug", command=self._open_debug_window).grid(row=0, column=5, padx=4)
 
         option_row = ttk.Frame(top)
         option_row.grid(row=0, column=4, sticky="w", padx=(8, 0))
@@ -580,6 +925,30 @@ class App(tk.Tk):
         )
         ttk.Button(folder_row, text="✅ Apply Folder Renames", command=self._apply_folder_renames).pack(side=tk.LEFT)
 
+        restructure_row = ttk.Frame(top)
+        restructure_row.grid(row=3, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
+        ttk.Checkbutton(
+            restructure_row,
+            text="Whole-tree restructure (root + subfolders)",
+            variable=self.restructure_recursive_var,
+            state="disabled",
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            restructure_row,
+            text="🧭 Suggest Folder Restructure",
+            command=self._start_folder_restructure_suggestions,
+        ).pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Button(
+            restructure_row,
+            text="✅ Apply Folder Restructure",
+            command=self._apply_folder_restructure,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            restructure_row,
+            text="Uses AI to review root + all subfolders and return a full folder-path reorganisation plan.",
+            foreground="#666",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
         dedupe_row = ttk.Frame(top)
         dedupe_row.grid(row=6, column=2, columnspan=3, sticky="w", padx=8, pady=(8, 0))
         ttk.Label(dedupe_row, text="🧹 Deduplicate:").pack(side=tk.LEFT)
@@ -597,9 +966,9 @@ class App(tk.Tk):
 
         ttk.Label(
             top,
-            text="Tip: Use folder suggestions to build a hierarchy like music_files > midi_files > classical > js_bach.",
+            text="Tip: Column headers are clickable for sorting. Restructure reviews the whole tree before proposing moves.",
             foreground="#666",
-        ).grid(row=3, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
+        ).grid(row=7, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
 
         top.columnconfigure(1, weight=1)
 
@@ -608,10 +977,11 @@ class App(tk.Tk):
 
         cols = ("original", "suggestion", "final", "status")
         self.tree = ttk.Treeview(table_wrapper, columns=cols, show="headings", selectmode="extended")
-        self.tree.heading("original", text="Original")
-        self.tree.heading("suggestion", text="AI Suggestion")
-        self.tree.heading("final", text="Final Filename")
-        self.tree.heading("status", text="Status")
+        # Clickable column headers for quick sorting while reviewing AI suggestions.
+        self.tree.heading("original", text="Original", command=lambda: self._sort_tree_by_column("original"))
+        self.tree.heading("suggestion", text="AI Suggestion", command=lambda: self._sort_tree_by_column("suggestion"))
+        self.tree.heading("final", text="Final Filename", command=lambda: self._sort_tree_by_column("final"))
+        self.tree.heading("status", text="Status", command=lambda: self._sort_tree_by_column("status"))
         self.tree.column("original", width=320)
         self.tree.column("suggestion", width=260)
         self.tree.column("final", width=320)
@@ -648,7 +1018,65 @@ class App(tk.Tk):
             endpoint=self.endpoint_var.get(),
             model=self.model_var.get(),
             api_key=self.api_key_var.get(),
+            debug_callback=self._queue_debug_event,
         )
+
+    def _queue_debug_event(self, message: str) -> None:
+        """Queue debug events from worker threads so UI updates stay thread-safe."""
+        self.ui_queue.put(("debug", message))
+
+    def _open_debug_window(self) -> None:
+        """Open a live debug window showing AI request/response payload summaries."""
+        if self.debug_window and self.debug_window.winfo_exists():
+            self.debug_window.deiconify()
+            self.debug_window.lift()
+            return
+
+        window = tk.Toplevel(self)
+        window.title("AI Debug Output")
+        window.geometry("980x520")
+        window.minsize(760, 380)
+        self.debug_window = window
+
+        controls = ttk.Frame(window, padding=8)
+        controls.pack(fill=tk.X)
+        ttk.Label(
+            controls,
+            text="📡 Live AI request/response log (payloads are truncated; Authorization is redacted).",
+            foreground="#555",
+        ).pack(side=tk.LEFT)
+        ttk.Button(controls, text="🧹 Clear", command=self._clear_debug_output).pack(side=tk.RIGHT)
+
+        text_frame = ttk.Frame(window, padding=(8, 0, 8, 8))
+        text_frame.pack(fill=tk.BOTH, expand=True)
+        self.debug_text = tk.Text(text_frame, wrap="word", font=("Consolas", 10))
+        yscroll = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.debug_text.yview)
+        self.debug_text.configure(yscrollcommand=yscroll.set)
+        self.debug_text.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+
+        for event in self.debug_events:
+            self.debug_text.insert(tk.END, event)
+        self.debug_text.see(tk.END)
+
+    def _clear_debug_output(self) -> None:
+        """Clear debug event history and on-screen debug text."""
+        self.debug_events.clear()
+        if self.debug_text and self.debug_text.winfo_exists():
+            self.debug_text.delete("1.0", tk.END)
+
+    def _append_debug_output(self, message: str) -> None:
+        """Append one debug event entry and keep memory bounded for long sessions."""
+        self.debug_events.append(message)
+        max_events = 500
+        if len(self.debug_events) > max_events:
+            self.debug_events = self.debug_events[-max_events:]
+
+        if self.debug_text and self.debug_text.winfo_exists():
+            self.debug_text.insert(tk.END, message)
+            self.debug_text.see(tk.END)
 
     def _handle_mode_change(self) -> None:
         """Adjust defaults and API key availability based on selected provider."""
@@ -675,6 +1103,7 @@ class App(tk.Tk):
 
         self.tree.delete(*self.tree.get_children())
         self.suggestions.clear()
+        self.folder_structure_suggestions.clear()
         self.status_var.set("Collecting files and requesting AI suggestions...")
 
         worker = threading.Thread(
@@ -768,6 +1197,7 @@ class App(tk.Tk):
             return
 
         self.folder_suggestions.clear()
+        self.folder_structure_suggestions.clear()
         self.folder_row_paths.clear()
         # Clear and repurpose the output grid so users can review folder names before applying.
         self.tree.delete(*self.tree.get_children())
@@ -849,6 +1279,117 @@ class App(tk.Tk):
         self.folder_rename_history = history
         self.folder_suggestions.clear()
         self.status_var.set(f"Folder rename complete: {len(history)} folder(s) renamed.")
+
+    def _start_folder_restructure_suggestions(self) -> None:
+        """Build AI suggestions for moving folders into cleaner category paths."""
+        folder = Path(self.folder_var.get()).expanduser()
+        if not folder.exists() or not folder.is_dir():
+            messagebox.showerror("Invalid folder", "Please choose a valid folder.")
+            return
+
+        self.folder_structure_suggestions.clear()
+        self.folder_row_paths.clear()
+        self.tree.delete(*self.tree.get_children())
+        self.status_var.set("Analyzing the full folder tree and building an AI restructure plan...")
+
+        worker = threading.Thread(
+            target=self._folder_restructure_worker,
+            args=(folder, self.restructure_recursive_var.get(), self._current_preferences()),
+            daemon=True,
+        )
+        worker.start()
+
+    def _folder_restructure_worker(self, folder: Path, recursive_folders: bool, preferences: FilenamePreferences) -> None:
+        """Generate a whole-tree AI restructure plan and sanitize it into executable moves."""
+        candidate_folders = collect_subfolders(folder, recursive_folders)
+        if not candidate_folders:
+            self.ui_queue.put(("status", "No subfolders found to restructure."))
+            return
+
+        provider = self._build_provider()
+        try:
+            inventory = build_folder_inventory(folder, recursive=True)
+            plan = provider.suggest_restructure_plan(inventory=inventory, preferences=preferences)
+            raw_operations = plan.get("folders", []) if isinstance(plan, dict) else []
+            operation_rows = raw_operations if isinstance(raw_operations, list) else []
+            sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
+        except Exception as exc:  # noqa: BLE001
+            self.ui_queue.put(("status", f"Restructure planning failed: {exc}"))
+            return
+
+        self.folder_structure_suggestions = sanitized
+        for idx, proposal in enumerate(self.folder_structure_suggestions, start=1):
+            self.ui_queue.put(("restructure_add", proposal))
+            self.ui_queue.put(
+                ("status", f"Restructure suggestion {idx}/{len(self.folder_structure_suggestions)}: {proposal.original_relative}"),
+            )
+
+        self.ui_queue.put(
+            (
+                "status",
+                f"Restructure suggestions ready: {len(self.folder_structure_suggestions)} operation(s). Click column headers to sort.",
+            )
+        )
+
+    def _apply_folder_restructure(self) -> None:
+        """Apply AI-planned folder moves for a root-wide reorganization."""
+        if not self.folder_structure_suggestions:
+            messagebox.showinfo("No restructure suggestions", "Run 'Suggest Folder Restructure' first.")
+            return
+
+        if not messagebox.askyesno(
+            "Confirm folder restructure",
+            f"Apply {len(self.folder_structure_suggestions)} folder move operation(s)?",
+        ):
+            return
+
+        root = Path(self.folder_var.get()).expanduser().resolve()
+        moved_folders = 0
+        skipped_count = 0
+
+        # Apply deepest items first so parent moves do not invalidate child paths mid-run.
+        ordered_moves = sorted(
+            self.folder_structure_suggestions,
+            key=lambda item: len(item.source_path.parts),
+            reverse=True,
+        )
+
+        for proposal in ordered_moves:
+            src = proposal.source_path
+            if not src.exists():
+                skipped_count += 1
+                continue
+
+            relative_parts = [part for part in Path(proposal.target_relative).parts if part not in (".", "..")]
+            if not relative_parts:
+                skipped_count += 1
+                continue
+
+            destination = root.joinpath(*relative_parts)
+            if destination == src:
+                continue
+            if str(destination).startswith(str(src) + os.sep):
+                skipped_count += 1
+                continue
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            candidate_destination = destination
+            counter = 1
+            while candidate_destination.exists() and candidate_destination != src:
+                candidate_destination = destination.with_name(f"{destination.name}_{counter}")
+                counter += 1
+
+            try:
+                src.rename(candidate_destination)
+                moved_folders += 1
+            except OSError:
+                skipped_count += 1
+
+        self.folder_structure_suggestions.clear()
+        self.status_var.set(
+            "Folder restructure complete: "
+            f"moved {moved_folders} folder(s), skipped {skipped_count}."
+        )
 
     def _start_duplicate_scan(self) -> None:
         """Start duplicate scan in a worker to keep the UI responsive."""
@@ -1004,10 +1545,39 @@ class App(tk.Tk):
                 )
                 # Keep exact paths for right-click Explorer actions.
                 self.folder_row_paths[row_id] = folder_rec.path
+            elif kind == "restructure_add":
+                move_rec: FolderStructureSuggestion = msg[1]
+                # Show both old and new structure paths for clearer pre-apply review.
+                old_path, new_path, transition = format_restructure_preview_paths(
+                    move_rec.original_relative,
+                    move_rec.target_relative,
+                )
+                row_id = self.tree.insert(
+                    "",
+                    tk.END,
+                    values=(old_path, new_path, transition, "Folder Move"),
+                )
+                self.folder_row_paths[row_id] = move_rec.source_path
             elif kind == "status":
                 self.status_var.set(msg[1])
+            elif kind == "debug":
+                self._append_debug_output(msg[1])
 
         self.after(80, self._process_ui_queue)
+
+    def _sort_tree_by_column(self, column_name: str) -> None:
+        """Sort current tree rows by the selected column and toggle asc/desc each click."""
+        row_ids = list(self.tree.get_children(""))
+        if not row_ids:
+            return
+
+        # Keep sorting lightweight with case-insensitive string comparison.
+        reverse = self.sort_state.get(column_name, False)
+        sorted_rows = sorted(row_ids, key=lambda row_id: str(self.tree.set(row_id, column_name)).lower(), reverse=reverse)
+        for index, row_id in enumerate(sorted_rows):
+            self.tree.move(row_id, "", index)
+
+        self.sort_state[column_name] = not reverse
 
     def _rename_indices(self, indices: Iterable[int]) -> None:
         rename_pairs: List[Tuple[Path, Path]] = []
