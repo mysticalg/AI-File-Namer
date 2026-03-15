@@ -303,6 +303,59 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertEqual(suggestions[0].original_relative, "Works for Solo Lute/Partita in C minor - BWV 997")
             self.assertEqual(suggestions[0].target_relative, "Partitas/Partita In C Minor Bwv 997")
 
+    def test_sanitize_restructure_operations_avoids_double_folder_suffix_when_ai_returns_full_path(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            cache = root / "iTunes" / "Album Artwork" / "Cache"
+            cache.mkdir(parents=True)
+
+            preferences = FilenamePreferences(
+                separator=" ",
+                capitalization="title",
+                max_filename_length=96,
+                max_folder_name_length=64,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {
+                    "type": "folder",
+                    "source": "iTunes/Album Artwork/Cache",
+                    # Model incorrectly returns final path instead of parent path.
+                    "destination": "Media/Artwork/Cache",
+                },
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0].target_relative, "Media/Artwork/Cache")
+
+    def test_sanitize_restructure_operations_collapses_duplicate_trailing_segment(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "Accapella" / "Artists (Alphabetical)" / "0"
+            source.mkdir(parents=True)
+
+            preferences = FilenamePreferences(
+                separator=" ",
+                capitalization="title",
+                max_filename_length=96,
+                max_folder_name_length=64,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {
+                    "type": "folder",
+                    "source": "Accapella/Artists (Alphabetical)/0",
+                    "destination": "Music/Vocal/Acapella/Artists Alphabetical/0",
+                },
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0].target_relative, "Music/Vocal/Acapella/Artists Alphabetical/0")
+
     def test_sanitize_restructure_operations_ignores_file_operations(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

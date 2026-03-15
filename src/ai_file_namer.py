@@ -802,6 +802,16 @@ def sanitize_restructure_operations(
     preferences: FilenamePreferences,
 ) -> List[FolderStructureSuggestion]:
     """Validate and sanitize AI-proposed operations into executable move suggestions."""
+
+    def _normalize_segment_for_compare(segment: str) -> str:
+        """Create a stable comparison key for path-segment equality checks."""
+        return sanitize_filename_stem(
+            segment,
+            separator=preferences.separator,
+            capitalization=preferences.capitalization,
+            max_length=preferences.max_folder_name_length,
+        ).strip().casefold()
+
     suggestions: List[FolderStructureSuggestion] = []
     for operation in operations:
         source_raw = str(operation.get("source", "")).strip().replace("\\", "/")
@@ -836,7 +846,24 @@ def sanitize_restructure_operations(
         )
         if not source_name:
             source_name = source_path.name
-        target_relative = "/".join([part for part in [sanitized_destination_parent, source_name] if part]) or source_name
+
+        # Some models ignore the "destination is a parent path" requirement and
+        # return a full target path that already includes the source folder name.
+        # Detect that case so we do not append the name twice (e.g. Cache/Cache).
+        target_relative = source_name
+        if sanitized_destination_parent:
+            destination_parts = [part for part in Path(sanitized_destination_parent).parts if part not in (".", "..")]
+            destination_tail = destination_parts[-1] if destination_parts else ""
+            if destination_tail and _normalize_segment_for_compare(destination_tail) == _normalize_segment_for_compare(source_name):
+                target_relative = "/".join(destination_parts)
+            else:
+                target_relative = "/".join([*destination_parts, source_name])
+
+        # Extra safety net: collapse accidental duplicate trailing segments.
+        target_parts = [part for part in Path(target_relative).parts if part not in (".", "..")]
+        while len(target_parts) >= 2 and _normalize_segment_for_compare(target_parts[-1]) == _normalize_segment_for_compare(target_parts[-2]):
+            target_parts.pop()
+        target_relative = "/".join(target_parts) or source_name
 
         if target_relative.replace("\\", "/").strip("/") == source_rel.replace("\\", "/").strip("/"):
             # Skip no-op moves so the preview table only shows actionable operations.
