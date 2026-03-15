@@ -10,7 +10,14 @@ from src.ai_file_namer import (
     format_date,
     group_duplicate_files,
     group_duplicate_folders,
+    FilenamePreferences,
+    extract_json_object,
+    format_restructure_preview_paths,
+    summarize_debug_headers,
+    summarize_debug_payload,
     remove_empty_folders,
+    sanitize_category_path,
+    sanitize_restructure_operations,
     sanitize_filename_stem,
 )
 
@@ -131,6 +138,88 @@ class FilenameUtilsTests(unittest.TestCase):
             groups = group_duplicate_folders([f1, f2])
             self.assertEqual(len(groups), 1)
             self.assertEqual({item.name for item in groups[0]}, {"one", "two"})
+
+    def test_sanitize_category_path_limits_depth_and_cleans_segments(self):
+        path = sanitize_category_path(
+            raw="Music > Classical / Bach / Organ / Extra",
+            separator="_",
+            capitalization="lower",
+            max_segment_length=12,
+            max_depth=3,
+        )
+        self.assertEqual(path, "music/classical/bach")
+
+    def test_sanitize_category_path_supports_title_case_with_spaces(self):
+        path = sanitize_category_path(
+            raw="personal photos/travel shots",
+            separator=" ",
+            capitalization="title",
+            max_segment_length=20,
+            max_depth=3,
+        )
+        self.assertEqual(path, "Personal Photos/Travel Shots")
+
+    def test_extract_json_object_reads_wrapped_json(self):
+        payload = "```json\n{\"operations\": [], \"dedupe_files\": true}\n```"
+        result = extract_json_object(payload)
+        self.assertIn("operations", result)
+        self.assertTrue(result.get("dedupe_files"))
+
+    def test_sanitize_restructure_operations_filters_invalid_entries(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            folder = root / "messy folder"
+            folder.mkdir()
+            file_path = folder / "track 01.mp3"
+            file_path.write_text("x")
+
+            preferences = FilenamePreferences(
+                separator=" ",
+                capitalization="title",
+                max_filename_length=96,
+                max_folder_name_length=32,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {"type": "folder", "source": "messy folder", "destination": "Music/Archive"},
+                {"type": "file", "source": "messy folder/track 01.mp3", "destination": "Music/Singles"},
+                {"type": "folder", "source": "../escape", "destination": "Bad"},
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            self.assertEqual(len(suggestions), 2)
+            self.assertEqual(suggestions[0].item_type, "folder")
+            self.assertIn("Music", suggestions[0].target_relative)
+
+    def test_format_restructure_preview_paths_outputs_old_new_and_transition(self):
+        old_path, new_path, transition = format_restructure_preview_paths(
+            "Old Folder/Sub",
+            "Music/Archive/Old Folder",
+        )
+        self.assertEqual(old_path, "Old Folder/Sub")
+        self.assertEqual(new_path, "Music/Archive/Old Folder")
+        self.assertIn("→", transition)
+
+    def test_format_restructure_preview_paths_normalizes_slashes(self):
+        old_path, new_path, transition = format_restructure_preview_paths(
+            r"old\nested",
+            r"new\bucket\old",
+        )
+        self.assertEqual(old_path, "old/nested")
+        self.assertEqual(new_path, "new/bucket/old")
+        self.assertEqual(transition, "old/nested → new/bucket/old")
+
+    def test_summarize_debug_headers_redacts_authorization(self):
+        headers = {"Authorization": "Bearer secret-token", "Content-Type": "application/json"}
+        result = summarize_debug_headers(headers)
+        self.assertEqual(result["Authorization"], "Bearer ***redacted***")
+        self.assertEqual(result["Content-Type"], "application/json")
+
+    def test_summarize_debug_payload_truncates_large_content(self):
+        payload = {"x": "a" * 6000}
+        result = summarize_debug_payload(payload, max_chars=120)
+        self.assertIn("truncated", result)
 
 
 if __name__ == "__main__":
