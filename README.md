@@ -26,6 +26,13 @@ pip install -r requirements.txt
 python src/ai_file_namer.py
 ```
 
+
+## Download installers
+Get the latest generated installers for both platforms from GitHub Releases:
+- **Latest release:** [releases/tag/latest](releases/tag/latest)
+- **All releases:** [releases](releases)
+
+
 ## Notes
 - The model should return concise names. The app sanitizes output for Windows-safe filenames.
 - Keep local/remote AI endpoint available for fast response.
