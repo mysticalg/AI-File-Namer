@@ -726,7 +726,7 @@ def extract_json_object(raw: str) -> Dict[str, object]:
 
 
 def extract_partial_restructure_operations(raw_text: str) -> List[Dict[str, str]]:
-    """Recover folder operations from partially truncated model output.
+    """Recover move operations from partially truncated model output.
 
     This fallback is used when the model returns incomplete JSON (for example a
     long `operations` list that is cut off before the final closing braces).
@@ -741,16 +741,20 @@ def extract_partial_restructure_operations(raw_text: str) -> List[Dict[str, str]
 
     for obj_text in object_pattern.findall(normalized):
         type_match = re.search(r'"type"\s*:\s*"([^"]+)"', obj_text)
+        if not type_match:
+            # Some models return `operation` instead of `type` for single-item payloads.
+            type_match = re.search(r'"operation"\s*:\s*"([^"]+)"', obj_text)
         source_match = re.search(r'"source"\s*:\s*"([^"]+)"', obj_text)
         destination_match = re.search(r'"destination"\s*:\s*"([^"]+)"', obj_text)
         if not type_match or not source_match or not destination_match:
             continue
-        if type_match.group(1).strip().lower() != "folder":
+        operation_type = type_match.group(1).strip().lower()
+        if operation_type not in {"folder", "file"}:
             continue
 
         operations.append(
             {
-                "type": "folder",
+                "type": operation_type,
                 "source": source_match.group(1).strip(),
                 "destination": destination_match.group(1).strip(),
             }
@@ -775,6 +779,28 @@ def extract_restructure_plan(raw: object, max_depth: int = 6) -> Dict[str, objec
             operations = value.get("operations")
             if isinstance(operations, list):
                 return value
+            if isinstance(operations, dict):
+                # Some models return a single operation object instead of an array.
+                normalized = dict(value)
+                normalized["operations"] = [operations]
+                return normalized
+
+            # Accept one-operation variants using `operation` + `source` + `destination`.
+            op_variant = str(value.get("operation", value.get("type", ""))).strip().lower()
+            source = value.get("source")
+            destination = value.get("destination")
+            if op_variant in {"folder", "file"} and isinstance(source, str) and isinstance(destination, str):
+                return {
+                    "operations": [
+                        {
+                            "type": op_variant,
+                            "source": source,
+                            "destination": destination,
+                        }
+                    ],
+                    "dedupe_files": bool(value.get("dedupe_files", True)),
+                    "reorganized_structure": value.get("reorganized_structure", []),
+                }
 
             for key in ("response", "message", "content", "output", "text"):
                 nested = value.get(key)

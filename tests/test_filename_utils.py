@@ -550,6 +550,31 @@ class FilenameUtilsTests(unittest.TestCase):
         self.assertIn("operations", plan)
         self.assertEqual(len(plan["operations"]), 2)
 
+    def test_extract_restructure_plan_supports_single_operation_shape(self):
+        payload = {
+            "response": """```json
+{
+  "operation": "folder",
+  "source": "Bach",
+  "destination": "Classical/Bach"
+}
+```"""
+        }
+        plan = extract_restructure_plan(payload)
+        self.assertIn("operations", plan)
+        self.assertEqual(len(plan["operations"]), 1)
+        self.assertEqual(plan["operations"][0]["type"], "folder")
+
+    def test_extract_partial_restructure_operations_supports_operation_key(self):
+        raw = """{
+  "operation": "file",
+  "source": "old/song.mid",
+  "destination": "classical/Bach/song.mid"
+}"""
+        ops = extract_partial_restructure_operations(raw)
+        self.assertEqual(len(ops), 1)
+        self.assertEqual(ops[0]["type"], "file")
+
 
 if __name__ == "__main__":
     unittest.main()
