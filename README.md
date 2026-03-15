@@ -3,7 +3,7 @@
 A Tkinter desktop app to bulk-rename images and videos using an AI model.
 
 ## Features
-- Select a folder and scan image/video files.
+- Select a folder and scan image/video files (optionally recursive through subfolders).
 - Configure AI as:
   - **Local**: Ollama `/api/generate` endpoint (example: `llava`).
   - **Remote**: OpenAI-compatible `/v1/chat/completions` endpoint.
@@ -12,6 +12,7 @@ A Tkinter desktop app to bulk-rename images and videos using an AI model.
 - Include optional date prefix using a custom `strftime` format.
 - Rename selected or all files with confirmation.
 - Roll back the last rename batch.
+- Suggest AI names for folders based on each directory's full contents and apply recursive folder categorisation.
 
 ## Install
 ```bash
@@ -34,7 +35,7 @@ A GitHub Actions workflow is included at `.github/workflows/build-installers.yml
 
 It runs on pushes, PRs, and manual dispatch and produces:
 - **Windows**
-  - `AIFileNamer.exe` via PyInstaller
+  - `AIFileNamer.exe` via PyInstaller (`--onefile`, self-contained)
   - `.msi` installer via cx_Freeze (`bdist_msi`)
 - **macOS**
   - `AIFileNamer.app` via PyInstaller

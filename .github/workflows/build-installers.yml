@@ -32,10 +32,12 @@ jobs:
         run: |
           python -m unittest discover -s tests -v
 
-      - name: Build Windows EXE (PyInstaller)
+      - name: Build Windows EXE (PyInstaller one-file)
         shell: bash
         run: |
-          pyinstaller --noconfirm --clean --windowed --name AIFileNamer src/ai_file_namer.py
+          # Build a self-contained single EXE so runtime DLLs are embedded
+          # and users don't need the adjacent `_internal` folder.
+          pyinstaller --noconfirm --clean --windowed --onefile --name AIFileNamer src/ai_file_namer.py
 
       - name: Build Windows MSI (cx_Freeze)
         shell: bash
@@ -46,7 +48,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifacts/windows
-          cp dist/AIFileNamer/AIFileNamer.exe artifacts/windows/AIFileNamer.exe
+          cp dist/AIFileNamer.exe artifacts/windows/AIFileNamer.exe
           find dist -maxdepth 1 -name "*.msi" -exec cp {} artifacts/windows/ \;
 
       - name: Upload Windows artifacts
