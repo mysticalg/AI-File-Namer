@@ -1257,6 +1257,11 @@ class App(tk.Tk):
         self.debug_text: Optional[tk.Text] = None
         self.ollama_models: List[str] = []
         self.oauth_in_progress = False
+        # Dialog widget references are optional because settings now live in popup windows.
+        self.model_combo: Optional[ttk.Combobox] = None
+        self.oauth_connect_button: Optional[ttk.Button] = None
+        self.oauth_disconnect_button: Optional[ttk.Button] = None
+        self.oauth_status_label: Optional[ttk.Label] = None
         self._settings_ready = False
 
         self._build_ui()
@@ -1283,6 +1288,15 @@ class App(tk.Tk):
         ttk.Button(source_frame, text="Browse", command=self._select_folder).grid(row=0, column=2, padx=4, pady=8)
         ttk.Button(source_frame, text="Scan + Suggest", command=self._start_scan).grid(row=0, column=3, padx=4, pady=8)
         ttk.Button(source_frame, text="🪵 AI Debug", command=self._open_debug_window).grid(row=0, column=4, padx=(4, 8), pady=8)
+        settings_button = ttk.Menubutton(source_frame, text="⚙️ Settings ▾")
+        settings_button.grid(row=0, column=5, padx=(0, 8), pady=8)
+        self._attach_tooltip(settings_button, "Open AI Provider and Naming Rules settings.")
+
+        # A compact top dropdown keeps the main workflow uncluttered while exposing advanced controls.
+        settings_menu = tk.Menu(settings_button, tearoff=0)
+        settings_menu.add_command(label="🧠 AI Provider", command=self._open_ai_provider_settings)
+        settings_menu.add_command(label="✍️ Naming Rules", command=self._open_naming_rules_settings)
+        settings_button.configure(menu=settings_menu)
 
         ttk.Checkbutton(
             source_frame,
@@ -1295,143 +1309,30 @@ class App(tk.Tk):
             foreground="#666",
         ).grid(row=1, column=2, columnspan=3, sticky="w", pady=(0, 8))
 
-        # 2) AI section: provider, endpoint, model and auth grouped together.
-        ai_frame = ttk.LabelFrame(top, text="🧠 AI Provider")
-        ai_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0), padx=(0, 6))
-        ai_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(ai_frame, text="Mode").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
-        mode_combo = ttk.Combobox(
-            ai_frame,
-            textvariable=self.provider_mode_var,
-            values=["Local (Ollama /api/generate)", "Remote (OpenAI-compatible /v1/chat/completions)"],
-            state="readonly",
+        # 2) Compact settings cards: full configuration now opens from top settings dropdown.
+        provider_card = ttk.LabelFrame(top, text="🧠 AI Provider")
+        provider_card.grid(row=1, column=0, sticky="nsew", pady=(10, 0), padx=(0, 6))
+        provider_card.columnconfigure(0, weight=1)
+        ttk.Label(
+            provider_card,
+            text="Provider setup moved to Settings ▾ for a cleaner main workflow.",
+            foreground="#666",
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        ttk.Button(provider_card, text="🧠 Open AI Provider Settings", command=self._open_ai_provider_settings).grid(
+            row=1, column=0, sticky="w", padx=8, pady=(0, 8)
         )
-        mode_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-        mode_combo.bind("<<ComboboxSelected>>", lambda _: self._handle_mode_change())
 
-        ttk.Label(ai_frame, text="Endpoint").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Entry(ai_frame, textvariable=self.endpoint_var).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-
-        ttk.Label(ai_frame, text="Model").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
-        model_row = ttk.Frame(ai_frame)
-        model_row.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-        model_row.columnconfigure(0, weight=1)
-        self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var)
-        self.model_combo.grid(row=0, column=0, sticky="ew")
-        ttk.Button(
-            model_row,
-            text="↻ Fetch Ollama Models",
-            command=self._start_ollama_model_refresh,
-        ).grid(row=0, column=1, padx=(6, 0))
-
-        ttk.Label(ai_frame, text="OpenAI OAuth Client ID").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Entry(ai_frame, textvariable=self.openai_client_id_var).grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-
-        oauth_controls = ttk.Frame(ai_frame)
-        oauth_controls.grid(row=4, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
-        self.oauth_connect_button = ttk.Button(oauth_controls, text="🔐 Connect OpenAI", command=self._start_openai_oauth_login)
-        self.oauth_connect_button.pack(side=tk.LEFT)
-        self.oauth_disconnect_button = ttk.Button(
-            oauth_controls,
-            text="🧹 Forget Token",
-            command=self._clear_openai_token,
+        naming_card = ttk.LabelFrame(top, text="✍️ Naming Rules")
+        naming_card.grid(row=1, column=1, sticky="nsew", pady=(10, 0), padx=(6, 0))
+        naming_card.columnconfigure(0, weight=1)
+        ttk.Label(
+            naming_card,
+            text="Naming conventions now live under Settings ▾.",
+            foreground="#666",
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        ttk.Button(naming_card, text="✍️ Open Naming Rules", command=self._open_naming_rules_settings).grid(
+            row=1, column=0, sticky="w", padx=8, pady=(0, 8)
         )
-        self.oauth_disconnect_button.pack(side=tk.LEFT, padx=(6, 0))
-
-        ttk.Label(ai_frame, text="Token Status").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
-        self.oauth_status_label = ttk.Label(ai_frame, text="Not connected", foreground="#666")
-        self.oauth_status_label.grid(row=5, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
-
-        ttk.Label(ai_frame, text="⏱️ AI timeout (sec)").grid(row=6, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Spinbox(
-            ai_frame,
-            from_=30,
-            to=3600,
-            increment=30,
-            textvariable=self.ai_timeout_seconds_var,
-            width=10,
-        ).grid(row=6, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
-
-        ttk.Label(
-            ai_frame,
-            text="Tip: Use OAuth Connect for OpenAI remote mode. Tokens are saved locally for reuse.",
-            foreground="#666",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
-
-        # 3) Naming section: filename/folder conventions together for predictability.
-        naming_frame = ttk.LabelFrame(top, text="✍️ Naming Rules")
-        naming_frame.grid(row=1, column=1, sticky="nsew", pady=(10, 0), padx=(6, 0))
-        naming_frame.columnconfigure(1, weight=1)
-
-        ttk.Checkbutton(
-            naming_frame,
-            text="Include date prefix",
-            variable=self.include_date_var,
-        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Label(naming_frame, text="Format").grid(row=0, column=1, sticky="e", padx=(0, 4), pady=(8, 0))
-        ttk.Entry(naming_frame, width=14, textvariable=self.date_format_var).grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Label(
-            naming_frame,
-            text="(strftime e.g. %Y-%m-%d)",
-            foreground="#666",
-        ).grid(row=0, column=3, sticky="w", padx=(0, 8), pady=(8, 0))
-
-        ttk.Label(naming_frame, text="Separator").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Combobox(
-            naming_frame,
-            width=18,
-            textvariable=self.word_separator_var,
-            state="readonly",
-            values=["Underscores (_)", "White spaces ( )"],
-        ).grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
-
-        ttk.Label(naming_frame, text="Case").grid(row=1, column=2, sticky="e", padx=(0, 4), pady=(8, 0))
-        ttk.Combobox(
-            naming_frame,
-            width=12,
-            textvariable=self.capitalization_var,
-            state="readonly",
-            values=["lowercase", "Title Case"],
-        ).grid(row=1, column=3, sticky="w", padx=(0, 8), pady=(8, 0))
-
-        ttk.Label(naming_frame, text="Max filename length").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Spinbox(
-            naming_frame,
-            from_=16,
-            to=MAX_WINDOWS_FILENAME_LENGTH,
-            width=6,
-            textvariable=self.max_filename_length_var,
-        ).grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
-        ttk.Label(
-            naming_frame,
-            text="Includes date + extension",
-            foreground="#666",
-        ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(8, 0))
-
-        ttk.Label(naming_frame, text="Max folder name length").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Spinbox(
-            naming_frame,
-            from_=8,
-            to=MAX_WINDOWS_FILENAME_LENGTH,
-            width=6,
-            textvariable=self.max_folder_name_length_var,
-        ).grid(row=3, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
-
-        ttk.Checkbutton(
-            naming_frame,
-            text="#️⃣ Include hashtags",
-            variable=self.include_hashtags_var,
-        ).grid(row=4, column=0, sticky="w", padx=8, pady=(8, 8))
-        ttk.Label(naming_frame, text="Count").grid(row=4, column=1, sticky="e", padx=(0, 4), pady=(8, 8))
-        ttk.Spinbox(naming_frame, from_=1, to=10, width=4, textvariable=self.hashtag_count_var).grid(
-            row=4, column=2, sticky="w", padx=(0, 8), pady=(8, 8)
-        )
-        ttk.Label(
-            naming_frame,
-            text="Hashtags stay inside your length limit.",
-            foreground="#666",
-        ).grid(row=4, column=3, sticky="w", padx=(0, 8), pady=(8, 8))
 
         # 4) Folder operations section: renaming, restructure, dedupe and cleanup.
         folder_ops_frame = ttk.LabelFrame(top, text="🗂️ Folder Operations")
@@ -1633,6 +1534,8 @@ class App(tk.Tk):
 
     def _refresh_oauth_status_label(self) -> None:
         """Show whether a reusable OpenAI OAuth token is available in app settings."""
+        if not self.oauth_status_label or not self.oauth_status_label.winfo_exists():
+            return
         token = self.api_key_var.get().strip()
         if token:
             prefix = token[:8]
@@ -1655,7 +1558,8 @@ class App(tk.Tk):
             return
 
         self.oauth_in_progress = True
-        self.oauth_connect_button.configure(state="disabled")
+        if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
+            self.oauth_connect_button.configure(state="disabled")
         self.status_var.set("Opening browser for OpenAI OAuth login…")
         worker = threading.Thread(target=self._openai_oauth_login_worker, daemon=True)
         worker.start()
@@ -1732,6 +1636,157 @@ class App(tk.Tk):
             self.debug_text.insert(tk.END, message)
             self.debug_text.see(tk.END)
 
+    def _attach_tooltip(self, widget: tk.Widget, text: str) -> None:
+        """Attach a lightweight tooltip so settings controls remain self-explanatory."""
+        tooltip_window: Optional[tk.Toplevel] = None
+
+        def show_tooltip(_: tk.Event) -> None:
+            nonlocal tooltip_window
+            if tooltip_window and tooltip_window.winfo_exists():
+                return
+            x = widget.winfo_rootx() + 14
+            y = widget.winfo_rooty() + widget.winfo_height() + 8
+            tooltip_window = tk.Toplevel(widget)
+            tooltip_window.wm_overrideredirect(True)
+            tooltip_window.wm_geometry(f"+{x}+{y}")
+            ttk.Label(
+                tooltip_window,
+                text=text,
+                background="#fffbe6",
+                foreground="#333",
+                relief="solid",
+                borderwidth=1,
+                padding=(8, 4),
+            ).pack()
+
+        def hide_tooltip(_: tk.Event) -> None:
+            nonlocal tooltip_window
+            if tooltip_window and tooltip_window.winfo_exists():
+                tooltip_window.destroy()
+            tooltip_window = None
+
+        widget.bind("<Enter>", show_tooltip)
+        widget.bind("<Leave>", hide_tooltip)
+
+    def _open_ai_provider_settings(self) -> None:
+        """Open AI-provider-specific settings in a dedicated popup dialog."""
+        window = tk.Toplevel(self)
+        window.title("AI Provider Settings")
+        window.geometry("760x390")
+        window.minsize(700, 340)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Mode").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
+        mode_combo = ttk.Combobox(
+            frame,
+            textvariable=self.provider_mode_var,
+            values=["Local (Ollama /api/generate)", "Remote (OpenAI-compatible /v1/chat/completions)"],
+            state="readonly",
+        )
+        mode_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        mode_combo.bind("<<ComboboxSelected>>", lambda _: self._handle_mode_change())
+
+        ttk.Label(frame, text="Endpoint").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Entry(frame, textvariable=self.endpoint_var).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(frame, text="Model").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
+        model_row = ttk.Frame(frame)
+        model_row.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        model_row.columnconfigure(0, weight=1)
+        self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var)
+        self.model_combo.grid(row=0, column=0, sticky="ew")
+        fetch_models_button = ttk.Button(model_row, text="↻ Fetch Ollama Models", command=self._start_ollama_model_refresh)
+        fetch_models_button.grid(row=0, column=1, padx=(6, 0))
+        self._attach_tooltip(fetch_models_button, "Refresh local Ollama models from the configured endpoint.")
+
+        ttk.Label(frame, text="OpenAI OAuth Client ID").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Entry(frame, textvariable=self.openai_client_id_var).grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+
+        oauth_controls = ttk.Frame(frame)
+        oauth_controls.grid(row=4, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.oauth_connect_button = ttk.Button(oauth_controls, text="🔐 Connect OpenAI", command=self._start_openai_oauth_login)
+        self.oauth_connect_button.pack(side=tk.LEFT)
+        self.oauth_disconnect_button = ttk.Button(oauth_controls, text="🧹 Forget Token", command=self._clear_openai_token)
+        self.oauth_disconnect_button.pack(side=tk.LEFT, padx=(6, 0))
+
+        ttk.Label(frame, text="Token Status").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        self.oauth_status_label = ttk.Label(frame, text="Not connected", foreground="#666")
+        self.oauth_status_label.grid(row=5, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
+
+        ttk.Label(frame, text="⏱️ AI timeout (sec)").grid(row=6, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Spinbox(frame, from_=30, to=3600, increment=30, textvariable=self.ai_timeout_seconds_var, width=10).grid(
+            row=6, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        ttk.Label(
+            frame,
+            text="Tip: Use OAuth Connect for OpenAI remote mode. Tokens are saved locally for reuse.",
+            foreground="#666",
+        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
+
+        self._handle_mode_change()
+        self._refresh_oauth_status_label()
+
+    def _open_naming_rules_settings(self) -> None:
+        """Open filename and folder naming preferences in a focused popup dialog."""
+        window = tk.Toplevel(self)
+        window.title("Naming Rules")
+        window.geometry("760x360")
+        window.minsize(700, 320)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Checkbutton(frame, text="📅 Include date prefix", variable=self.include_date_var).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(8, 0)
+        )
+        ttk.Label(frame, text="Format").grid(row=0, column=1, sticky="e", padx=(0, 4), pady=(8, 0))
+        ttk.Entry(frame, width=14, textvariable=self.date_format_var).grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(frame, text="(strftime e.g. %Y-%m-%d)", foreground="#666").grid(
+            row=0, column=3, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+
+        ttk.Label(frame, text="Separator").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Combobox(
+            frame,
+            width=18,
+            textvariable=self.word_separator_var,
+            state="readonly",
+            values=["Underscores (_)", "White spaces ( )"],
+        ).grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(frame, text="Case").grid(row=1, column=2, sticky="e", padx=(0, 4), pady=(8, 0))
+        ttk.Combobox(
+            frame,
+            width=12,
+            textvariable=self.capitalization_var,
+            state="readonly",
+            values=["lowercase", "Title Case"],
+        ).grid(row=1, column=3, sticky="w", padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(frame, text="Max filename length").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Spinbox(frame, from_=16, to=MAX_WINDOWS_FILENAME_LENGTH, width=6, textvariable=self.max_filename_length_var).grid(
+            row=2, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        ttk.Label(frame, text="Includes date + extension", foreground="#666").grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+
+        ttk.Label(frame, text="Max folder name length").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Spinbox(frame, from_=8, to=MAX_WINDOWS_FILENAME_LENGTH, width=6, textvariable=self.max_folder_name_length_var).grid(
+            row=3, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+
+        ttk.Checkbutton(frame, text="#️⃣ Include hashtags", variable=self.include_hashtags_var).grid(
+            row=4, column=0, sticky="w", padx=8, pady=(8, 8)
+        )
+        ttk.Label(frame, text="Count").grid(row=4, column=1, sticky="e", padx=(0, 4), pady=(8, 8))
+        ttk.Spinbox(frame, from_=1, to=10, width=4, textvariable=self.hashtag_count_var).grid(
+            row=4, column=2, sticky="w", padx=(0, 8), pady=(8, 8)
+        )
+        ttk.Label(frame, text="Hashtags stay inside your length limit.", foreground="#666").grid(
+            row=4, column=3, sticky="w", padx=(0, 8), pady=(8, 8)
+        )
+
     def _handle_mode_change(self) -> None:
         """Adjust defaults and OAuth controls based on selected provider mode."""
         self._capture_provider_fields_for_mode()
@@ -1740,17 +1795,23 @@ class App(tk.Tk):
             # Keep the user's local endpoint/model choices instead of resetting each toggle.
             self.endpoint_var.set(self.local_endpoint or DEFAULT_LOCAL_ENDPOINT)
             self.model_var.set(self.local_model or DEFAULT_LOCAL_MODEL)
-            self.model_combo.configure(state="normal")
-            self.oauth_connect_button.configure(state="disabled")
-            self.oauth_disconnect_button.configure(state="disabled")
+            if self.model_combo and self.model_combo.winfo_exists():
+                self.model_combo.configure(state="normal")
+            if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
+                self.oauth_connect_button.configure(state="disabled")
+            if self.oauth_disconnect_button and self.oauth_disconnect_button.winfo_exists():
+                self.oauth_disconnect_button.configure(state="disabled")
             self._start_ollama_model_refresh()
         else:
             # Keep the user's remote endpoint/model choices instead of resetting each toggle.
             self.endpoint_var.set(self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT)
             self.model_var.set(self.remote_model or DEFAULT_REMOTE_MODEL)
-            self.model_combo.configure(state="normal")
-            self.oauth_connect_button.configure(state="normal" if not self.oauth_in_progress else "disabled")
-            self.oauth_disconnect_button.configure(state="normal")
+            if self.model_combo and self.model_combo.winfo_exists():
+                self.model_combo.configure(state="normal")
+            if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
+                self.oauth_connect_button.configure(state="normal" if not self.oauth_in_progress else "disabled")
+            if self.oauth_disconnect_button and self.oauth_disconnect_button.winfo_exists():
+                self.oauth_disconnect_button.configure(state="normal")
 
         self._refresh_oauth_status_label()
 
@@ -2330,7 +2391,8 @@ class App(tk.Tk):
             elif kind == "ollama_models":
                 models: List[str] = msg[1]
                 self.ollama_models = models
-                self.model_combo.configure(values=models)
+                if self.model_combo and self.model_combo.winfo_exists():
+                    self.model_combo.configure(values=models)
                 # Keep the current model if valid; otherwise default to the first discovered model.
                 if models and self.model_var.get() not in models:
                     self.model_var.set(models[0])
