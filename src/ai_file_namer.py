@@ -898,192 +898,209 @@ class App(tk.Tk):
         self.after(80, self._process_ui_queue)
 
     def _build_ui(self) -> None:
+        """Build a sectioned, task-first layout so scanning, provider setup, and actions are easy to follow."""
         top = ttk.Frame(self, padding=12)
         top.pack(fill=tk.X)
+        top.columnconfigure(0, weight=1)
+        top.columnconfigure(1, weight=1)
 
-        ttk.Label(top, text="📂 Folder", width=12).grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.folder_var).grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(top, text="Browse", command=self._select_folder).grid(row=0, column=2, padx=4)
-        ttk.Button(top, text="Scan + Suggest", command=self._start_scan).grid(row=0, column=3, padx=4)
-        ttk.Button(top, text="🪵 AI Debug", command=self._open_debug_window).grid(row=0, column=5, padx=4)
+        # 1) Source section: choose input folder and run primary scan action.
+        source_frame = ttk.LabelFrame(top, text="📂 Source")
+        source_frame.grid(row=0, column=0, columnspan=2, sticky="ew")
+        source_frame.columnconfigure(1, weight=1)
 
-        option_row = ttk.Frame(top)
-        option_row.grid(row=0, column=4, sticky="w", padx=(8, 0))
+        ttk.Label(source_frame, text="Folder").grid(row=0, column=0, sticky="w", padx=8, pady=8)
+        ttk.Entry(source_frame, textvariable=self.folder_var).grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=8)
+        ttk.Button(source_frame, text="Browse", command=self._select_folder).grid(row=0, column=2, padx=4, pady=8)
+        ttk.Button(source_frame, text="Scan + Suggest", command=self._start_scan).grid(row=0, column=3, padx=4, pady=8)
+        ttk.Button(source_frame, text="🪵 AI Debug", command=self._open_debug_window).grid(row=0, column=4, padx=(4, 8), pady=8)
+
         ttk.Checkbutton(
-            option_row,
+            source_frame,
             text="Recursive files",
             variable=self.recursive_scan_var,
-        ).pack(side=tk.LEFT)
+        ).grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(0, 8))
         ttk.Label(
-            option_row,
-            text="Looks inside subfolders",
+            source_frame,
+            text="Scans files in all subfolders.",
             foreground="#666",
-        ).pack(side=tk.LEFT, padx=(6, 0))
+        ).grid(row=1, column=2, columnspan=3, sticky="w", pady=(0, 8))
 
-        ttk.Label(top, text="🧠 AI Mode", width=12).grid(row=1, column=0, sticky="w", pady=(10, 0))
+        # 2) AI section: provider, endpoint, model and auth grouped together.
+        ai_frame = ttk.LabelFrame(top, text="🧠 AI Provider")
+        ai_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0), padx=(0, 6))
+        ai_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(ai_frame, text="Mode").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
         mode_combo = ttk.Combobox(
-            top,
+            ai_frame,
             textvariable=self.provider_mode_var,
             values=["Local (Ollama /api/generate)", "Remote (OpenAI-compatible /v1/chat/completions)"],
             state="readonly",
         )
-        mode_combo.grid(row=1, column=1, sticky="ew", padx=8, pady=(10, 0))
+        mode_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
         mode_combo.bind("<<ComboboxSelected>>", lambda _: self._handle_mode_change())
 
-        ttk.Label(top, text="🌐 Endpoint").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(top, textvariable=self.endpoint_var).grid(row=2, column=1, sticky="ew", padx=8, pady=(10, 0))
+        ttk.Label(ai_frame, text="Endpoint").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Entry(ai_frame, textvariable=self.endpoint_var).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
 
-        ttk.Label(top, text="🧩 Model").grid(row=3, column=0, sticky="w", pady=(10, 0))
-        model_row = ttk.Frame(top)
-        model_row.grid(row=3, column=1, sticky="ew", padx=8, pady=(10, 0))
+        ttk.Label(ai_frame, text="Model").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
+        model_row = ttk.Frame(ai_frame)
+        model_row.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        model_row.columnconfigure(0, weight=1)
         self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var)
-        self.model_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.model_combo.grid(row=0, column=0, sticky="ew")
         ttk.Button(
             model_row,
             text="↻ Fetch Ollama Models",
             command=self._start_ollama_model_refresh,
-        ).pack(side=tk.LEFT, padx=(6, 0))
+        ).grid(row=0, column=1, padx=(6, 0))
+
+        ttk.Label(ai_frame, text="API Key").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
+        self.api_entry = ttk.Entry(ai_frame, textvariable=self.api_key_var, show="*")
+        self.api_entry.grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+
         ttk.Label(
-            top,
-            text="Tip: for Local mode, refresh to list all installed Ollama models.",
+            ai_frame,
+            text="Tip: Local mode can auto-load installed Ollama models.",
             foreground="#666",
-        ).grid(row=3, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
 
-        ttk.Label(top, text="🔐 API Key").grid(row=4, column=0, sticky="w", pady=(10, 0))
-        self.api_entry = ttk.Entry(top, textvariable=self.api_key_var, show="*")
-        self.api_entry.grid(row=4, column=1, sticky="ew", padx=8, pady=(10, 0))
+        # 3) Naming section: filename/folder conventions together for predictability.
+        naming_frame = ttk.LabelFrame(top, text="✍️ Naming Rules")
+        naming_frame.grid(row=1, column=1, sticky="nsew", pady=(10, 0), padx=(6, 0))
+        naming_frame.columnconfigure(1, weight=1)
 
-        date_row = ttk.Frame(top)
-        date_row.grid(row=1, column=2, columnspan=3, sticky="w", padx=8)
         ttk.Checkbutton(
-            date_row,
-            text="Include date",
+            naming_frame,
+            text="Include date prefix",
             variable=self.include_date_var,
-        ).pack(side=tk.LEFT)
-        ttk.Label(date_row, text="Format:").pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Entry(date_row, width=14, textvariable=self.date_format_var).pack(side=tk.LEFT)
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(naming_frame, text="Format").grid(row=0, column=1, sticky="e", padx=(0, 4), pady=(8, 0))
+        ttk.Entry(naming_frame, width=14, textvariable=self.date_format_var).grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
         ttk.Label(
-            date_row,
-            text="(strftime, e.g. %Y-%m-%d)",
+            naming_frame,
+            text="(strftime e.g. %Y-%m-%d)",
             foreground="#666",
-        ).pack(side=tk.LEFT, padx=8)
+        ).grid(row=0, column=3, sticky="w", padx=(0, 8), pady=(8, 0))
 
-        naming_row = ttk.Frame(top)
-        naming_row.grid(row=4, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
-        ttk.Label(naming_row, text="🧰 Separator:").pack(side=tk.LEFT)
+        ttk.Label(naming_frame, text="Separator").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Combobox(
-            naming_row,
+            naming_frame,
             width=18,
             textvariable=self.word_separator_var,
             state="readonly",
             values=["Underscores (_)", "White spaces ( )"],
-        ).pack(side=tk.LEFT, padx=(6, 10))
-        ttk.Label(naming_row, text="🔠 Case:").pack(side=tk.LEFT)
+        ).grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(naming_frame, text="Case").grid(row=1, column=2, sticky="e", padx=(0, 4), pady=(8, 0))
         ttk.Combobox(
-            naming_row,
+            naming_frame,
             width=12,
             textvariable=self.capitalization_var,
             state="readonly",
             values=["lowercase", "Title Case"],
-        ).pack(side=tk.LEFT, padx=(6, 10))
-        ttk.Label(naming_row, text="📏 Max filename length:").pack(side=tk.LEFT)
+        ).grid(row=1, column=3, sticky="w", padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(naming_frame, text="Max filename length").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Spinbox(
-            naming_row,
+            naming_frame,
             from_=16,
             to=MAX_WINDOWS_FILENAME_LENGTH,
             width=6,
             textvariable=self.max_filename_length_var,
-        ).pack(side=tk.LEFT, padx=(6, 4))
-        ttk.Label(naming_row, text="(includes date + extension)", foreground="#666").pack(side=tk.LEFT)
+        ).grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(
+            naming_frame,
+            text="Includes date + extension",
+            foreground="#666",
+        ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(8, 0))
 
-        folder_name_row = ttk.Frame(top)
-        folder_name_row.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(folder_name_row, text="📁 Max folder name length:").pack(side=tk.LEFT)
+        ttk.Label(naming_frame, text="Max folder name length").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Spinbox(
-            folder_name_row,
+            naming_frame,
             from_=8,
             to=MAX_WINDOWS_FILENAME_LENGTH,
             width=6,
             textvariable=self.max_folder_name_length_var,
-        ).pack(side=tk.LEFT, padx=(6, 4))
-        ttk.Label(
-            folder_name_row,
-            text="Used when generating AI folder suggestions.",
-            foreground="#666",
-        ).pack(side=tk.LEFT)
+        ).grid(row=3, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
 
-        hashtag_row = ttk.Frame(top)
-        hashtag_row.grid(row=5, column=2, columnspan=3, sticky="w", padx=8, pady=(8, 0))
         ttk.Checkbutton(
-            hashtag_row,
+            naming_frame,
             text="#️⃣ Include hashtags",
             variable=self.include_hashtags_var,
-        ).pack(side=tk.LEFT)
-        ttk.Label(hashtag_row, text="Count:").pack(side=tk.LEFT, padx=(10, 4))
-        ttk.Spinbox(hashtag_row, from_=1, to=10, width=4, textvariable=self.hashtag_count_var).pack(side=tk.LEFT)
+        ).grid(row=4, column=0, sticky="w", padx=8, pady=(8, 8))
+        ttk.Label(naming_frame, text="Count").grid(row=4, column=1, sticky="e", padx=(0, 4), pady=(8, 8))
+        ttk.Spinbox(naming_frame, from_=1, to=10, width=4, textvariable=self.hashtag_count_var).grid(
+            row=4, column=2, sticky="w", padx=(0, 8), pady=(8, 8)
+        )
         ttk.Label(
-            hashtag_row,
-            text="AI and local post-processing keep tags inside your character limit.",
+            naming_frame,
+            text="Hashtags stay inside your length limit.",
             foreground="#666",
-        ).pack(side=tk.LEFT, padx=8)
+        ).grid(row=4, column=3, sticky="w", padx=(0, 8), pady=(8, 8))
 
-        folder_row = ttk.Frame(top)
-        folder_row.grid(row=2, column=2, columnspan=3, sticky="w", padx=8)
+        # 4) Folder operations section: renaming, restructure, dedupe and cleanup.
+        folder_ops_frame = ttk.LabelFrame(top, text="🗂️ Folder Operations")
+        folder_ops_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        folder_ops_frame.columnconfigure(4, weight=1)
+
         ttk.Checkbutton(
-            folder_row,
+            folder_ops_frame,
             text="Recursive folder categorisation",
             variable=self.recursive_folder_rename_var,
-        ).pack(side=tk.LEFT)
-        ttk.Button(folder_row, text="🗂️ Suggest Folder Names", command=self._start_folder_suggestions).pack(
-            side=tk.LEFT, padx=(10, 4)
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Button(folder_ops_frame, text="🗂️ Suggest Folder Names", command=self._start_folder_suggestions).grid(
+            row=0, column=1, sticky="w", padx=4, pady=(8, 0)
         )
-        ttk.Button(folder_row, text="✅ Apply Folder Renames", command=self._apply_folder_renames).pack(side=tk.LEFT)
+        ttk.Button(folder_ops_frame, text="✅ Apply Folder Renames", command=self._apply_folder_renames).grid(
+            row=0, column=2, sticky="w", padx=4, pady=(8, 0)
+        )
 
-        restructure_row = ttk.Frame(top)
-        restructure_row.grid(row=3, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
         ttk.Checkbutton(
-            restructure_row,
+            folder_ops_frame,
             text="Include subfolders in restructure",
             variable=self.restructure_recursive_var,
-        ).pack(side=tk.LEFT)
+        ).grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Button(
-            restructure_row,
+            folder_ops_frame,
             text="🧭 Suggest Folder Restructure",
             command=self._start_folder_restructure_suggestions,
-        ).pack(side=tk.LEFT, padx=(10, 4))
+        ).grid(row=1, column=1, sticky="w", padx=4, pady=(8, 0))
         ttk.Button(
-            restructure_row,
+            folder_ops_frame,
             text="✅ Apply Folder Restructure",
             command=self._apply_folder_restructure,
-        ).pack(side=tk.LEFT)
+        ).grid(row=1, column=2, sticky="w", padx=4, pady=(8, 0))
         ttk.Label(
-            restructure_row,
-            text="Uses AI to review the full tree and propose consolidated folder/file moves.",
+            folder_ops_frame,
+            text="Reviews the whole tree and proposes grouped destinations.",
             foreground="#666",
-        ).pack(side=tk.LEFT, padx=(8, 0))
+        ).grid(row=1, column=3, columnspan=2, sticky="w", padx=8, pady=(8, 0))
 
-        dedupe_row = ttk.Frame(top)
-        dedupe_row.grid(row=6, column=2, columnspan=3, sticky="w", padx=8, pady=(8, 0))
-        ttk.Label(dedupe_row, text="🧹 Deduplicate:").pack(side=tk.LEFT)
+        ttk.Label(folder_ops_frame, text="Deduplicate").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 8))
         ttk.Combobox(
-            dedupe_row,
+            folder_ops_frame,
             width=16,
             textvariable=self.dedupe_keep_var,
             values=["Keep first match", "Keep last match"],
             state="readonly",
-        ).pack(side=tk.LEFT, padx=(8, 8))
-        ttk.Button(dedupe_row, text="🔁 Find Duplicates", command=self._start_duplicate_scan).pack(side=tk.LEFT)
-        ttk.Button(dedupe_row, text="✅ Apply Deduplication", command=self._apply_deduplication).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(dedupe_row, text="🗑️ Remove Empty Folders", command=self._remove_empty_folders).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(dedupe_row, text="(files + folders)", foreground="#666").pack(side=tk.LEFT, padx=8)
+        ).grid(row=2, column=1, sticky="w", padx=4, pady=(8, 8))
+        ttk.Button(folder_ops_frame, text="🔁 Find Duplicates", command=self._start_duplicate_scan).grid(
+            row=2, column=2, sticky="w", padx=4, pady=(8, 8)
+        )
+        ttk.Button(folder_ops_frame, text="✅ Apply Deduplication", command=self._apply_deduplication).grid(
+            row=2, column=3, sticky="w", padx=4, pady=(8, 8)
+        )
+        ttk.Button(folder_ops_frame, text="🗑️ Remove Empty Folders", command=self._remove_empty_folders).grid(
+            row=2, column=4, sticky="w", padx=4, pady=(8, 8)
+        )
 
         ttk.Label(
             top,
-            text="Tip: Column headers are clickable for sorting. Restructure reviews the whole tree before proposing moves.",
+            text="Tip: click table column headers to sort suggestions before applying actions.",
             foreground="#666",
-        ).grid(row=7, column=2, columnspan=3, sticky="w", padx=8, pady=(10, 0))
-
-        top.columnconfigure(1, weight=1)
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         table_wrapper = ttk.Frame(self, padding=(12, 0, 12, 0))
         table_wrapper.pack(fill=tk.BOTH, expand=True)
