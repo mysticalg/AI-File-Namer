@@ -32,11 +32,34 @@ from src.ai_file_namer import (
     clamp_ai_timeout_seconds,
     build_ollama_missing_guidance,
     extract_openai_text_content,
+    build_openai_models_endpoint,
+    parse_openai_model_names,
 )
 
 
 class FilenameUtilsTests(unittest.TestCase):
 
+
+
+    def test_build_openai_models_endpoint_from_chat_completions(self):
+        endpoint = build_openai_models_endpoint("https://api.openai.com/v1/chat/completions")
+        self.assertEqual(endpoint, "https://api.openai.com/v1/models")
+
+    def test_build_openai_models_endpoint_from_nested_path(self):
+        endpoint = build_openai_models_endpoint("https://proxy.example.com/openai/v1/chat/completions")
+        self.assertEqual(endpoint, "https://proxy.example.com/openai/v1/models")
+
+    def test_parse_openai_model_names_filters_non_chat_ids(self):
+        payload = {
+            "data": [
+                {"id": "gpt-4o-mini"},
+                {"id": "whisper-1"},
+                {"id": "text-embedding-3-small"},
+                {"id": "gpt-4.1"},
+                {"id": "gpt-4o-mini"},
+            ]
+        }
+        self.assertEqual(parse_openai_model_names(payload), ["gpt-4.1", "gpt-4o-mini"])
 
     def test_extract_openai_text_content_supports_chat_completions_string(self):
         payload = {
