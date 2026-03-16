@@ -13,6 +13,7 @@ import subprocess
 import sys
 import shutil
 import threading
+import time
 import urllib.parse
 import webbrowser
 from dataclasses import dataclass
@@ -40,7 +41,7 @@ DEFAULT_OPENAI_OAUTH_CLIENT_ID = os.environ.get("OPENAI_OAUTH_CLIENT_ID", "")
 DEFAULT_OPENAI_OAUTH_AUTH_URL = "https://auth.openai.com/oauth/authorize"
 DEFAULT_OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 DEFAULT_OPENAI_OAUTH_SCOPE = "openid profile email offline_access"
-DEFAULT_OPENAI_OAUTH_AUDIENCE = os.environ.get("OPENAI_OAUTH_AUDIENCE", "api.openai.com")
+DEFAULT_OPENAI_OAUTH_AUDIENCE = os.environ.get("OPENAI_OAUTH_AUDIENCE", "")
 DEFAULT_OPENAI_OAUTH_REDIRECT_HOST = "127.0.0.1"
 DEFAULT_OPENAI_OAUTH_REDIRECT_PORT = 8765
 DEFAULT_OPENAI_OAUTH_REDIRECT_URI = os.environ.get(
@@ -91,6 +92,67 @@ def clamp_ai_timeout_seconds(value: Any) -> int:
     """Clamp timeout settings to a safe, user-adjustable range."""
     parsed = _coerce_int_setting(value, DEFAULT_AI_TIMEOUT_SECONDS)
     return max(30, min(parsed, 3600))
+
+
+def parse_retry_after_seconds(value: str) -> Optional[float]:
+    """Parse HTTP Retry-After header values into seconds when possible."""
+    if not value:
+        return None
+    try:
+        parsed = float(value.strip())
+    except ValueError:
+        # Date-based Retry-After values are uncommon for these APIs; ignore if unparsable.
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def build_openai_rate_limit_guidance(retry_after_seconds: Optional[float]) -> str:
+    """Provide actionable guidance when OpenAI responds with HTTP 429."""
+    retry_hint = ""
+    if retry_after_seconds is not None:
+        retry_hint = f" Retry after about {max(1, int(round(retry_after_seconds)))} second(s)."
+    return (
+        "OpenAI rate limit reached (HTTP 429). This can happen even for a single request "
+        "when account/project rate limits or quota are currently exceeded."
+        f"{retry_hint}"
+    )
+
+
+def normalize_openai_oauth_audience(audience: str) -> str:
+    """Normalize audience values so legacy defaults do not break OpenAI OAuth login."""
+    cleaned = (audience or "").strip()
+    if cleaned in {"api.openai.com", "https://api.openai.com", "https://api.openai.com/"}:
+        # OpenAI's desktop OAuth flows commonly do not require `audience`; omit legacy value.
+        return ""
+    return cleaned
+
+
+def validate_openai_oauth_urls(auth_url: str, token_url: str) -> None:
+    """Validate OAuth endpoint URLs and raise actionable errors for common misconfiguration."""
+    auth_parsed = urllib.parse.urlparse((auth_url or "").strip())
+    token_parsed = urllib.parse.urlparse((token_url or "").strip())
+
+    if auth_parsed.scheme != "https" or token_parsed.scheme != "https":
+        raise ValueError("OpenAI OAuth auth/token URLs must use https.")
+    if not auth_parsed.netloc or not token_parsed.netloc:
+        raise ValueError("OpenAI OAuth auth/token URLs are invalid.")
+
+    # Strongly guide default OpenAI configuration while still allowing compatible providers.
+    if auth_parsed.hostname == "auth.openai.com" and token_parsed.hostname == "auth.openai.com":
+        if not auth_parsed.path.endswith("/oauth/authorize"):
+            raise ValueError("OpenAI auth URL should end with /oauth/authorize.")
+        if not token_parsed.path.endswith("/oauth/token"):
+            raise ValueError("OpenAI token URL should end with /oauth/token.")
+
+
+def build_openai_oauth_client_id_guidance() -> str:
+    """Explain why OAuth needs a client ID while still using user-login consent."""
+    return (
+        "OpenAI OAuth requires a Client ID because OAuth identifies the requesting app. "
+        "You still sign in with your OpenAI account and approve permissions in-browser; "
+        "the app then receives an access token. No client secret or manual key paste is required "
+        "for this desktop PKCE flow."
+    )
 
 
 def describe_capitalization_mode(mode: str) -> str:
@@ -166,6 +228,8 @@ class OpenAIOAuthClient:
         if not self.client_id.startswith("app_"):
             raise ValueError("OpenAI OAuth Client ID should start with 'app_'.")
 
+        validate_openai_oauth_urls(self.auth_url, self.token_url)
+
         parsed_redirect = urllib.parse.urlparse(self.redirect_uri)
         if parsed_redirect.scheme != "http" or not parsed_redirect.hostname or not parsed_redirect.port:
             raise ValueError(
@@ -174,6 +238,7 @@ class OpenAIOAuthClient:
         if parsed_redirect.hostname not in {"127.0.0.1", "localhost"}:
             raise ValueError("OpenAI redirect URI host must be 127.0.0.1 or localhost for desktop callback flow.")
         redirect_uri = self.redirect_uri
+        normalized_audience = normalize_openai_oauth_audience(self.audience)
         verifier = secrets.token_urlsafe(64)
         state = secrets.token_urlsafe(24)
         challenge = _pkce_code_challenge(verifier)
@@ -194,11 +259,13 @@ class OpenAIOAuthClient:
                     "state": state,
                     "code_challenge": challenge,
                     "code_challenge_method": "S256",
-                    **({"audience": self.audience} if self.audience else {}),
+                    **({"audience": normalized_audience} if normalized_audience else {}),
                 }
             )
             auth_link = f"{self.auth_url}?{query}"
-            webbrowser.open(auth_link, new=1)
+            browser_opened = webbrowser.open(auth_link, new=1)
+            if browser_opened is False:
+                raise RuntimeError("Could not open a web browser automatically for OAuth login.")
             callback_server.handle_request()
             result = getattr(callback_server, "auth_result", None)
 
@@ -335,6 +402,45 @@ class AIProvider:
             return
         self.debug_callback(format_debug_event(title, details))
 
+    def _post_json_with_remote_rate_limit_handling(
+        self,
+        endpoint: str,
+        payload: Dict[str, object],
+        headers: Optional[Dict[str, str]],
+        timeout_seconds: int,
+        request_kind: str,
+    ) -> Any:
+        """Send JSON request and apply one fast retry when remote APIs return HTTP 429."""
+        import requests
+
+        max_attempts = 2 if self.mode.startswith("Remote") else 1
+        for attempt in range(max_attempts):
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout_seconds)
+
+            if self.mode.startswith("Remote") and response.status_code == 429:
+                retry_after_seconds = parse_retry_after_seconds(response.headers.get("Retry-After", ""))
+                if attempt < max_attempts - 1:
+                    wait_seconds = min(max(retry_after_seconds or 1.5, 0.5), 4.0)
+                    self._emit_debug(
+                        f"AI rate limit: retrying {request_kind}",
+                        {
+                            "status_code": response.status_code,
+                            "retry_after_seconds": retry_after_seconds,
+                            "wait_seconds": wait_seconds,
+                            "attempt": attempt + 1,
+                        },
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+
+                raise RuntimeError(build_openai_rate_limit_guidance(retry_after_seconds))
+
+            response.raise_for_status()
+            return response
+
+        # Defensive fallback (the loop should always return or raise above).
+        raise RuntimeError(f"Request failed for {request_kind}.")
+
     def suggest_name(
         self,
         image_bytes: bytes,
@@ -411,8 +517,13 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
-            response.raise_for_status()
+            response = self._post_json_with_remote_rate_limit_handling(
+                endpoint=self.endpoint,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=self.timeout_seconds,
+                request_kind="remote chat completion",
+            )
             response_json = response.json()
             content = extract_openai_text_content(response_json)
             self._emit_debug(
@@ -491,8 +602,13 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
-            response.raise_for_status()
+            response = self._post_json_with_remote_rate_limit_handling(
+                endpoint=self.endpoint,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=self.timeout_seconds,
+                request_kind="remote chat completion",
+            )
             response_json = response.json()
             content = extract_openai_text_content(response_json)
             self._emit_debug(
@@ -565,8 +681,13 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
-            response.raise_for_status()
+            response = self._post_json_with_remote_rate_limit_handling(
+                endpoint=self.endpoint,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=self.timeout_seconds,
+                request_kind="remote chat completion",
+            )
             response_json = response.json()
             content = extract_openai_text_content(response_json)
             self._emit_debug(
@@ -655,8 +776,13 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
-            response.raise_for_status()
+            response = self._post_json_with_remote_rate_limit_handling(
+                endpoint=self.endpoint,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=self.timeout_seconds,
+                request_kind="remote chat completion",
+            )
             response_json = response.json()
             content = extract_openai_text_content(response_json)
             self._emit_debug(
@@ -967,6 +1093,11 @@ def build_openai_models_endpoint(chat_completions_endpoint: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return ""
 
+    # Guard against using Ollama's local generate endpoint in remote OpenAI mode.
+    # Appending `/v1/models` to `/api/generate` creates a guaranteed 404.
+    if parsed.path.rstrip("/").endswith("/api/generate"):
+        return ""
+
     if "/v1/" in parsed.path:
         base_path = parsed.path.split("/v1/", 1)[0]
         model_path = f"{base_path}/v1/models"
@@ -1015,13 +1146,16 @@ def fetch_openai_model_names(chat_completions_endpoint: str, api_key: str, timeo
 
     models_endpoint = build_openai_models_endpoint(chat_completions_endpoint)
     if not models_endpoint:
-        raise ValueError("OpenAI endpoint is invalid. Expected an https://.../v1/chat/completions style URL.")
+        raise ValueError("OpenAI endpoint is invalid for remote model discovery. Use an OpenAI-compatible .../v1/chat/completions URL (not Ollama /api/generate).")
     token = api_key.strip()
     if not token:
         raise ValueError("OpenAI API key is required to fetch remote models.")
 
     headers = {"Authorization": f"Bearer {token}"}
     response = requests.get(models_endpoint, headers=headers, timeout=timeout_seconds)
+    if response.status_code == 429:
+        retry_after_seconds = parse_retry_after_seconds(response.headers.get("Retry-After", ""))
+        raise RuntimeError(build_openai_rate_limit_guidance(retry_after_seconds))
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
@@ -1950,7 +2084,7 @@ class App(tk.Tk):
         if not self.openai_client_id_var.get().strip():
             messagebox.showerror(
                 "OpenAI OAuth Client ID missing",
-                "OpenAI browser OAuth requires a configured Client ID.\n\n"
+                f"{build_openai_oauth_client_id_guidance()}\n\n"
                 "Set OPENAI_OAUTH_CLIENT_ID (recommended) or enter a Client ID in AI Provider settings, "
                 "then click Connect OpenAI again.\n\n"
                 "After that, sign-in happens in-browser and returns to this app automatically—"
@@ -1960,6 +2094,13 @@ class App(tk.Tk):
             return
 
         # Preflight validation catches common config mismatch before opening browser.
+        try:
+            validate_openai_oauth_urls(self.openai_auth_url_var.get(), self.openai_token_url_var.get())
+        except ValueError as exc:
+            messagebox.showerror("OAuth configuration error", str(exc))
+            self.status_var.set(f"OpenAI OAuth config error: {exc}")
+            return
+
         auth_host = urllib.parse.urlparse(self.openai_auth_url_var.get().strip()).hostname or ""
         token_host = urllib.parse.urlparse(self.openai_token_url_var.get().strip()).hostname or ""
         if auth_host != "auth.openai.com" or token_host != "auth.openai.com":
@@ -1968,6 +2109,12 @@ class App(tk.Tk):
                 "OpenAI OAuth endpoints should normally use auth.openai.com.\n\n"
                 "If you changed auth/token URLs intentionally for a compatible provider, ignore this warning.",
             )
+
+        normalized_audience = normalize_openai_oauth_audience(self.openai_audience_var.get())
+        if normalized_audience != self.openai_audience_var.get().strip():
+            # Keep UI values aligned with what will actually be sent to reduce confusion.
+            self.openai_audience_var.set(normalized_audience)
+            self.status_var.set("OAuth Audience reset to default (blank) for OpenAI compatibility.")
 
         self.oauth_in_progress = True
         if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
@@ -2139,11 +2286,16 @@ class App(tk.Tk):
         )
 
         ttk.Label(frame, text="OpenAI OAuth Client ID").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Entry(frame, textvariable=self.openai_client_id_var).grid(row=4, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        client_id_entry = ttk.Entry(frame, textvariable=self.openai_client_id_var)
+        client_id_entry.grid(row=4, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self._attach_tooltip(
+            client_id_entry,
+            "Required for OAuth because it identifies this app. User still logs in and consents in browser.",
+        )
         ttk.Label(frame, text="OpenAI OAuth Audience").grid(row=5, column=0, sticky="w", padx=8, pady=(8, 0))
         audience_entry = ttk.Entry(frame, textvariable=self.openai_audience_var)
         audience_entry.grid(row=5, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-        self._attach_tooltip(audience_entry, "Usually api.openai.com. Leave default unless OpenAI support says otherwise.")
+        self._attach_tooltip(audience_entry, "Usually leave blank for OpenAI. Set only if OpenAI support instructs a specific audience.")
         ttk.Label(frame, text="OpenAI Redirect URI").grid(row=6, column=0, sticky="w", padx=8, pady=(8, 0))
         redirect_entry = ttk.Entry(frame, textvariable=self.openai_redirect_uri_var)
         redirect_entry.grid(row=6, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
@@ -2153,7 +2305,7 @@ class App(tk.Tk):
         )
         ttk.Label(
             frame,
-            text="OAuth is optional. API key + remote model is enough for OpenAI remote mode.",
+            text="OAuth is optional. OAuth login still requires an app Client ID; API key works without OAuth setup.",
             foreground="#666",
         ).grid(row=7, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
 
@@ -2321,10 +2473,13 @@ class App(tk.Tk):
         if not self.provider_mode_var.get().startswith("Remote"):
             return
 
-        # Ensure remote mode always targets OpenAI chat-completions when using API-key auth.
+        # Ensure remote mode always targets an OpenAI-compatible chat-completions endpoint.
         endpoint = self.endpoint_var.get().strip()
-        if not endpoint or endpoint == DEFAULT_LOCAL_ENDPOINT:
-            self.endpoint_var.set(self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT)
+        if not endpoint or endpoint == DEFAULT_LOCAL_ENDPOINT or endpoint.rstrip("/").endswith("/api/generate"):
+            fallback_endpoint = self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT
+            self.endpoint_var.set(fallback_endpoint)
+            endpoint = fallback_endpoint
+            self.ui_queue.put(("status", "Remote mode requires a /v1/chat/completions endpoint; switched from Ollama /api/generate."))
         token = self.api_key_var.get().strip()
         if not token:
             self.status_var.set("Add an OpenAI API key to fetch remote model options.")
@@ -3026,7 +3181,7 @@ class App(tk.Tk):
                     error_text = (
                         f"{error_text}\n\n"
                         "OpenAI returned an unknown_error before callback. Double-check:\n"
-                        "• Client ID starts with app_ and is active\n"
+                        "• Client ID starts with app_ and is active (OAuth requires a Client ID)\n"
                         "• Redirect URI in this app exactly matches OpenAI app settings\n"
                         "• OAuth Audience (if required) matches your OpenAI app configuration\n"
                         "• Auth/Token URLs are auth.openai.com"
