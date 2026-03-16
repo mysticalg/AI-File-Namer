@@ -34,6 +34,8 @@ from src.ai_file_namer import (
     extract_openai_text_content,
     build_openai_models_endpoint,
     parse_openai_model_names,
+    parse_retry_after_seconds,
+    build_openai_rate_limit_guidance,
 )
 
 
@@ -48,6 +50,21 @@ class FilenameUtilsTests(unittest.TestCase):
     def test_build_openai_models_endpoint_from_nested_path(self):
         endpoint = build_openai_models_endpoint("https://proxy.example.com/openai/v1/chat/completions")
         self.assertEqual(endpoint, "https://proxy.example.com/openai/v1/models")
+
+    def test_build_openai_models_endpoint_rejects_ollama_generate_path(self):
+        endpoint = build_openai_models_endpoint("http://localhost:11434/api/generate")
+        self.assertEqual(endpoint, "")
+
+    def test_parse_retry_after_seconds_handles_numeric_and_invalid_values(self):
+        self.assertEqual(parse_retry_after_seconds("3"), 3.0)
+        self.assertEqual(parse_retry_after_seconds("1.5"), 1.5)
+        self.assertIsNone(parse_retry_after_seconds(""))
+        self.assertIsNone(parse_retry_after_seconds("soon"))
+
+    def test_build_openai_rate_limit_guidance_explains_single_request_limit(self):
+        message = build_openai_rate_limit_guidance(2)
+        self.assertIn("single request", message)
+        self.assertIn("Retry after about 2 second(s)", message)
 
     def test_parse_openai_model_names_filters_non_chat_ids(self):
         payload = {

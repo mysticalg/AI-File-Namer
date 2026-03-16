@@ -13,6 +13,7 @@ import subprocess
 import sys
 import shutil
 import threading
+import time
 import urllib.parse
 import webbrowser
 from dataclasses import dataclass
@@ -91,6 +92,30 @@ def clamp_ai_timeout_seconds(value: Any) -> int:
     """Clamp timeout settings to a safe, user-adjustable range."""
     parsed = _coerce_int_setting(value, DEFAULT_AI_TIMEOUT_SECONDS)
     return max(30, min(parsed, 3600))
+
+
+def parse_retry_after_seconds(value: str) -> Optional[float]:
+    """Parse HTTP Retry-After header values into seconds when possible."""
+    if not value:
+        return None
+    try:
+        parsed = float(value.strip())
+    except ValueError:
+        # Date-based Retry-After values are uncommon for these APIs; ignore if unparsable.
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def build_openai_rate_limit_guidance(retry_after_seconds: Optional[float]) -> str:
+    """Provide actionable guidance when OpenAI responds with HTTP 429."""
+    retry_hint = ""
+    if retry_after_seconds is not None:
+        retry_hint = f" Retry after about {max(1, int(round(retry_after_seconds)))} second(s)."
+    return (
+        "OpenAI rate limit reached (HTTP 429). This can happen even for a single request "
+        "when account/project rate limits or quota are currently exceeded."
+        f"{retry_hint}"
+    )
 
 
 def describe_capitalization_mode(mode: str) -> str:
@@ -335,6 +360,45 @@ class AIProvider:
             return
         self.debug_callback(format_debug_event(title, details))
 
+    def _post_json_with_remote_rate_limit_handling(
+        self,
+        endpoint: str,
+        payload: Dict[str, object],
+        headers: Optional[Dict[str, str]],
+        timeout_seconds: int,
+        request_kind: str,
+    ) -> Any:
+        """Send JSON request and apply one fast retry when remote APIs return HTTP 429."""
+        import requests
+
+        max_attempts = 2 if self.mode.startswith("Remote") else 1
+        for attempt in range(max_attempts):
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout_seconds)
+
+            if self.mode.startswith("Remote") and response.status_code == 429:
+                retry_after_seconds = parse_retry_after_seconds(response.headers.get("Retry-After", ""))
+                if attempt < max_attempts - 1:
+                    wait_seconds = min(max(retry_after_seconds or 1.5, 0.5), 4.0)
+                    self._emit_debug(
+                        f"AI rate limit: retrying {request_kind}",
+                        {
+                            "status_code": response.status_code,
+                            "retry_after_seconds": retry_after_seconds,
+                            "wait_seconds": wait_seconds,
+                            "attempt": attempt + 1,
+                        },
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+
+                raise RuntimeError(build_openai_rate_limit_guidance(retry_after_seconds))
+
+            response.raise_for_status()
+            return response
+
+        # Defensive fallback (the loop should always return or raise above).
+        raise RuntimeError(f"Request failed for {request_kind}.")
+
     def suggest_name(
         self,
         image_bytes: bytes,
@@ -411,8 +475,13 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
-            response.raise_for_status()
+            response = self._post_json_with_remote_rate_limit_handling(
+                endpoint=self.endpoint,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=self.timeout_seconds,
+                request_kind="remote chat completion",
+            )
             response_json = response.json()
             content = extract_openai_text_content(response_json)
             self._emit_debug(
@@ -491,8 +560,13 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
-            response.raise_for_status()
+            response = self._post_json_with_remote_rate_limit_handling(
+                endpoint=self.endpoint,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=self.timeout_seconds,
+                request_kind="remote chat completion",
+            )
             response_json = response.json()
             content = extract_openai_text_content(response_json)
             self._emit_debug(
@@ -565,8 +639,13 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
-            response.raise_for_status()
+            response = self._post_json_with_remote_rate_limit_handling(
+                endpoint=self.endpoint,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=self.timeout_seconds,
+                request_kind="remote chat completion",
+            )
             response_json = response.json()
             content = extract_openai_text_content(response_json)
             self._emit_debug(
@@ -655,8 +734,13 @@ class AIProvider:
                     "payload": summarize_debug_payload(payload),
                 },
             )
-            response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
-            response.raise_for_status()
+            response = self._post_json_with_remote_rate_limit_handling(
+                endpoint=self.endpoint,
+                payload=payload,
+                headers=headers,
+                timeout_seconds=self.timeout_seconds,
+                request_kind="remote chat completion",
+            )
             response_json = response.json()
             content = extract_openai_text_content(response_json)
             self._emit_debug(
@@ -967,6 +1051,11 @@ def build_openai_models_endpoint(chat_completions_endpoint: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return ""
 
+    # Guard against using Ollama's local generate endpoint in remote OpenAI mode.
+    # Appending `/v1/models` to `/api/generate` creates a guaranteed 404.
+    if parsed.path.rstrip("/").endswith("/api/generate"):
+        return ""
+
     if "/v1/" in parsed.path:
         base_path = parsed.path.split("/v1/", 1)[0]
         model_path = f"{base_path}/v1/models"
@@ -1015,13 +1104,16 @@ def fetch_openai_model_names(chat_completions_endpoint: str, api_key: str, timeo
 
     models_endpoint = build_openai_models_endpoint(chat_completions_endpoint)
     if not models_endpoint:
-        raise ValueError("OpenAI endpoint is invalid. Expected an https://.../v1/chat/completions style URL.")
+        raise ValueError("OpenAI endpoint is invalid for remote model discovery. Use an OpenAI-compatible .../v1/chat/completions URL (not Ollama /api/generate).")
     token = api_key.strip()
     if not token:
         raise ValueError("OpenAI API key is required to fetch remote models.")
 
     headers = {"Authorization": f"Bearer {token}"}
     response = requests.get(models_endpoint, headers=headers, timeout=timeout_seconds)
+    if response.status_code == 429:
+        retry_after_seconds = parse_retry_after_seconds(response.headers.get("Retry-After", ""))
+        raise RuntimeError(build_openai_rate_limit_guidance(retry_after_seconds))
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
@@ -2321,10 +2413,13 @@ class App(tk.Tk):
         if not self.provider_mode_var.get().startswith("Remote"):
             return
 
-        # Ensure remote mode always targets OpenAI chat-completions when using API-key auth.
+        # Ensure remote mode always targets an OpenAI-compatible chat-completions endpoint.
         endpoint = self.endpoint_var.get().strip()
-        if not endpoint or endpoint == DEFAULT_LOCAL_ENDPOINT:
-            self.endpoint_var.set(self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT)
+        if not endpoint or endpoint == DEFAULT_LOCAL_ENDPOINT or endpoint.rstrip("/").endswith("/api/generate"):
+            fallback_endpoint = self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT
+            self.endpoint_var.set(fallback_endpoint)
+            endpoint = fallback_endpoint
+            self.ui_queue.put(("status", "Remote mode requires a /v1/chat/completions endpoint; switched from Ollama /api/generate."))
         token = self.api_key_var.get().strip()
         if not token:
             self.status_var.set("Add an OpenAI API key to fetch remote model options.")
