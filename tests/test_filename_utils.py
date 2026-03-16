@@ -31,10 +31,49 @@ from src.ai_file_namer import (
     save_app_settings,
     clamp_ai_timeout_seconds,
     build_ollama_missing_guidance,
+    extract_openai_text_content,
 )
 
 
 class FilenameUtilsTests(unittest.TestCase):
+
+
+    def test_extract_openai_text_content_supports_chat_completions_string(self):
+        payload = {
+            "choices": [
+                {"message": {"content": "final_name"}},
+            ]
+        }
+        self.assertEqual(extract_openai_text_content(payload), "final_name")
+
+    def test_extract_openai_text_content_supports_list_content_blocks(self):
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "output_text", "text": "first"},
+                            {"type": "output_text", "text": "second"},
+                        ]
+                    }
+                }
+            ]
+        }
+        self.assertEqual(extract_openai_text_content(payload), "first\nsecond")
+
+    def test_extract_openai_text_content_supports_responses_api_output(self):
+        payload = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "structured_result"}
+                    ],
+                }
+            ]
+        }
+        self.assertEqual(extract_openai_text_content(payload), "structured_result")
+
 
     def test_clamp_ai_timeout_seconds_respects_bounds(self):
         self.assertEqual(clamp_ai_timeout_seconds(120), 120)
@@ -284,6 +323,41 @@ class FilenameUtilsTests(unittest.TestCase):
         self.assertEqual(normalize_ai_destination_relative_path("/Bach", root, preferences), "")
         self.assertEqual(normalize_ai_destination_relative_path("", root, preferences), "")
 
+    def test_normalize_ai_destination_relative_path_strips_windows_absolute_prefix(self):
+        root = Path("/tmp/Bach")
+        preferences = FilenamePreferences(
+            separator=" ",
+            capitalization="title",
+            max_filename_length=96,
+            max_folder_name_length=64,
+            include_hashtags=False,
+            hashtag_count=3,
+        )
+        value = normalize_ai_destination_relative_path(
+            "D:/OneDrive/Music/midi/classical/Bach/Works/Invent",
+            root,
+            preferences,
+        )
+        self.assertEqual(value, "Works/Invent")
+
+    def test_normalize_ai_destination_relative_path_drops_unmatched_absolute_path(self):
+        root = Path("/tmp/Bach")
+        preferences = FilenamePreferences(
+            separator=" ",
+            capitalization="title",
+            max_filename_length=96,
+            max_folder_name_length=64,
+            include_hashtags=False,
+            hashtag_count=3,
+        )
+        value = normalize_ai_destination_relative_path(
+            "D:/Completely/Other/Tree/NotRelated",
+            root,
+            preferences,
+        )
+        self.assertEqual(value, "")
+
+
     def test_sanitize_restructure_operations_handles_absolute_and_root_destination(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "Bach"
@@ -307,6 +381,33 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertEqual(len(suggestions), 1)
             self.assertEqual(suggestions[0].original_relative, "Works for Solo Lute")
             self.assertEqual(suggestions[0].target_relative, "Works For Solo Lute")
+
+    def test_sanitize_restructure_operations_handles_windows_absolute_destination(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "Bach"
+            source = root / "Works" / "Invent"
+            source.mkdir(parents=True)
+
+            preferences = FilenamePreferences(
+                separator=" ",
+                capitalization="title",
+                max_filename_length=96,
+                max_folder_name_length=64,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {
+                    "type": "folder",
+                    "source": "Works/Invent",
+                    "destination": "D:/OneDrive/Music/midi/classical/Bach",
+                },
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            self.assertEqual(len(suggestions), 1)
+            # Ensure absolute drive prefixes are stripped instead of creating `D/...` folders.
+            self.assertEqual(suggestions[0].target_relative, "Invent")
 
     def test_sanitize_restructure_operations_handles_nested_absolute_paths(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
