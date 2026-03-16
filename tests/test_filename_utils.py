@@ -255,6 +255,17 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertEqual(sorted(item.item_type for item in suggestions), ["file", "folder"])
             self.assertTrue(all("Music" in item.target_relative for item in suggestions))
 
+    def test_build_folder_inventory_can_exclude_files(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            (root / "album").mkdir()
+            (root / "album" / "track01.mp3").write_text("x")
+
+            inventory = build_folder_inventory(root, recursive=True, include_files=False)
+
+            self.assertEqual(inventory.get("total_file_count"), 0)
+            self.assertEqual(inventory.get("file_paths"), [])
+
     def test_normalize_ai_source_relative_path_strips_root_prefix(self):
         root = Path("/tmp/Bach")
         self.assertEqual(normalize_ai_source_relative_path("/Bach/Works", root), "Works")

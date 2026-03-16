@@ -616,7 +616,7 @@ class AIProvider:
             "Plan once from the root inventory (do not recursively re-plan each subfolder). "
             "Use shallow logical categories and consolidate duplicates. "
             "Avoid over-nesting and avoid creating one-off folders when an existing shared category works. "
-            "Use file extensions to infer media/document categories and improve consistency of file naming. "
+            "When file_paths are present, use file extensions to infer media/document categories and improve consistency of file naming. "
             f"Use {style_description} and {case_description}. "
             "Do not include markdown. "
             "Every source folder should appear exactly once in operations (unless intentionally unchanged). "
@@ -926,6 +926,7 @@ def build_ollama_missing_guidance(error_text: str) -> str:
 def build_folder_inventory(
     folder: Path,
     recursive: bool,
+    include_files: bool = True,
     max_nodes: int = 240,
     max_files: int = 420,
 ) -> Dict[str, object]:
@@ -935,7 +936,7 @@ def build_folder_inventory(
     small and fast while still preserving enough tree context to plan moves.
     """
     folders = collect_subfolders(folder, recursive=recursive)
-    files = sorted(path for path in folder.glob("**/*" if recursive else "*") if path.is_file())
+    files = sorted(path for path in folder.glob("**/*" if recursive else "*") if path.is_file()) if include_files else []
     folder_paths = [str(path.relative_to(folder)).replace("\\", "/") for path in folders]
     sampled_paths = folder_paths[:max_nodes]
     file_paths = [str(path.relative_to(folder)).replace("\\", "/") for path in files]
@@ -956,6 +957,7 @@ def build_folder_inventory(
         # One list of relative folder paths is enough to describe restructure sources.
         "folder_paths": sampled_paths,
         # Include sampled file paths so the planner can suggest tidy file/folder moves too.
+        # Users can disable this when they only want folder-level restructuring.
         "file_paths": sampled_files,
         # Root-level cardinality helps the model estimate plan scope without row bloat.
         "total_folder_count": len(folders),
@@ -1362,6 +1364,7 @@ class App(tk.Tk):
         self.recursive_scan_var = tk.BooleanVar(value=bool(loaded_settings.get("recursive_scan", True)))
         self.recursive_folder_rename_var = tk.BooleanVar(value=bool(loaded_settings.get("recursive_folder_rename", True)))
         self.restructure_recursive_var = tk.BooleanVar(value=bool(loaded_settings.get("restructure_recursive", True)))
+        self.restructure_include_files_var = tk.BooleanVar(value=bool(loaded_settings.get("restructure_include_files", True)))
         self.date_format_var = tk.StringVar(value=str(loaded_settings.get("date_format", "%Y-%m-%d")))
         # Default to human-readable names as requested: spaces + title case.
         self.word_separator_var = tk.StringVar(value=str(loaded_settings.get("word_separator", "White spaces ( )")))
@@ -1513,6 +1516,16 @@ class App(tk.Tk):
             text="Include subfolders in restructure",
             variable=self.restructure_recursive_var,
         ).grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
+        include_files_check = ttk.Checkbutton(
+            folder_ops_frame,
+            text="Include files in restructure planning",
+            variable=self.restructure_include_files_var,
+        )
+        include_files_check.grid(row=1, column=3, sticky="w", padx=8, pady=(8, 0))
+        self._attach_tooltip(
+            include_files_check,
+            "Enable this to let AI propose file moves/renames during folder restructure planning.",
+        )
         ttk.Button(
             folder_ops_frame,
             text="🧭 Suggest Folder Restructure",
@@ -1525,9 +1538,9 @@ class App(tk.Tk):
         ).grid(row=1, column=2, sticky="w", padx=4, pady=(8, 0))
         ttk.Label(
             folder_ops_frame,
-            text="Reviews the whole tree and proposes grouped destinations.",
+            text="Choose folder-only planning for faster, cleaner category moves.",
             foreground="#666",
-        ).grid(row=1, column=3, columnspan=2, sticky="w", padx=8, pady=(8, 0))
+        ).grid(row=1, column=4, sticky="w", padx=8, pady=(8, 0))
 
         ttk.Label(folder_ops_frame, text="Deduplicate").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 8))
         ttk.Combobox(
@@ -1625,6 +1638,7 @@ class App(tk.Tk):
             "recursive_scan": self.recursive_scan_var.get(),
             "recursive_folder_rename": self.recursive_folder_rename_var.get(),
             "restructure_recursive": self.restructure_recursive_var.get(),
+            "restructure_include_files": self.restructure_include_files_var.get(),
             "date_format": self.date_format_var.get(),
             "word_separator": self.word_separator_var.get(),
             "capitalization": self.capitalization_var.get(),
@@ -1678,6 +1692,7 @@ class App(tk.Tk):
             self.recursive_scan_var,
             self.recursive_folder_rename_var,
             self.restructure_recursive_var,
+            self.restructure_include_files_var,
             self.date_format_var,
             self.word_separator_var,
             self.capitalization_var,
@@ -2304,16 +2319,30 @@ class App(tk.Tk):
         self.row_open_paths.clear()
         self.row_thumbnail_images.clear()
         self.tree.delete(*self.tree.get_children())
-        self.status_var.set("Analyzing the full folder tree and building an AI restructure plan...")
+        if self.restructure_include_files_var.get():
+            self.status_var.set("Analyzing folders and files to build an AI restructure plan...")
+        else:
+            self.status_var.set("Analyzing folder structure only to build an AI restructure plan...")
 
         worker = threading.Thread(
             target=self._folder_restructure_worker,
-            args=(folder, self.restructure_recursive_var.get(), self._current_preferences()),
+            args=(
+                folder,
+                self.restructure_recursive_var.get(),
+                self.restructure_include_files_var.get(),
+                self._current_preferences(),
+            ),
             daemon=True,
         )
         worker.start()
 
-    def _folder_restructure_worker(self, folder: Path, recursive_folders: bool, preferences: FilenamePreferences) -> None:
+    def _folder_restructure_worker(
+        self,
+        folder: Path,
+        recursive_folders: bool,
+        include_files: bool,
+        preferences: FilenamePreferences,
+    ) -> None:
         """Generate a whole-tree AI restructure plan and sanitize it into executable moves."""
         candidate_folders = collect_subfolders(folder, recursive_folders)
         if not candidate_folders:
@@ -2328,12 +2357,17 @@ class App(tk.Tk):
             plan: Dict[str, object] = {}
             operation_rows: List[Dict[str, object]] = []
             sanitized: List[FolderStructureSuggestion] = []
-            inventory = build_folder_inventory(folder, recursive=recursive_folders)
+            inventory = build_folder_inventory(
+                folder,
+                recursive=recursive_folders,
+                include_files=include_files,
+            )
 
             for variant_index, (node_limit, file_limit) in enumerate(inventory_variants, start=1):
                 inventory = build_folder_inventory(
                     folder,
                     recursive=recursive_folders,
+                    include_files=include_files,
                     max_nodes=node_limit,
                     max_files=file_limit,
                 )
