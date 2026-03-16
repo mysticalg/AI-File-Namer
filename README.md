@@ -41,6 +41,20 @@ Get the latest generated installers for both platforms from GitHub Releases:
 - Remote mode requires an OpenAI account: https://platform.openai.com/signup
 - Keep local/remote AI endpoint available for fast response.
 
+## FAQ: "[truncated ... chars]" in AI debug logs
+- Most systems label long payloads as `...[truncated N chars]` **only in logs/UI output** to keep logs readable and avoid huge terminal/UI rendering costs.
+- In those cases, the model usually still receives the full request/response body that was sent over the API.
+- The only way to be sure is to check transport-level facts:
+  - request/response size limits in your provider docs,
+  - HTTP status codes/errors (for example 400/413 for payload too large),
+  - token-limit errors returned by the model endpoint.
+- If you are near limits, chunking is a valid approach:
+  - split large context into ordered chunks,
+  - include a stable item ID and chunk index (e.g., `doc-42 chunk 3/8`),
+  - ask the model to acknowledge each chunk,
+  - then send a final synthesis request that references the acknowledged chunks.
+- Chunking works best when each chunk is self-contained and you repeat critical instructions (goal, output format) in each call.
+
 ## CI: Build installers automatically
 A GitHub Actions workflow is included at `.github/workflows/build-installers.yml`.
 
