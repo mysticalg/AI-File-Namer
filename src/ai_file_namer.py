@@ -1839,20 +1839,20 @@ class App(tk.Tk):
         self.ui_queue.put(("debug", message))
 
     def _refresh_oauth_status_label(self) -> None:
-        """Show whether a reusable OpenAI OAuth token is available in app settings."""
+        """Show whether a remote credential (manual API key or OAuth token) is configured."""
         if not self.oauth_status_label or not self.oauth_status_label.winfo_exists():
             return
         token = self.api_key_var.get().strip()
         if token:
             prefix = token[:8]
-            self.oauth_status_label.configure(text=f"Connected (token starts with: {prefix}…)", foreground="#0a6f2b")
+            self.oauth_status_label.configure(text=f"Configured (starts with: {prefix}…)", foreground="#0a6f2b")
         else:
-            self.oauth_status_label.configure(text="Not connected", foreground="#666")
+            self.oauth_status_label.configure(text="No credential configured", foreground="#666")
 
     def _clear_openai_token(self) -> None:
-        """Forget persisted OAuth token so remote requests no longer authenticate."""
+        """Forget persisted remote credential (manual API key or OAuth token)."""
         self.api_key_var.set("")
-        self.status_var.set("Cleared stored OpenAI OAuth token.")
+        self.status_var.set("Cleared stored remote API credential.")
         self._refresh_oauth_status_label()
 
     def _start_openai_oauth_login(self) -> None:
@@ -2034,15 +2034,24 @@ class App(tk.Tk):
         fetch_models_button.grid(row=0, column=1, padx=(6, 0))
         self._attach_tooltip(fetch_models_button, "Refresh local Ollama models from the configured endpoint.")
 
-        ttk.Label(frame, text="OpenAI OAuth Client ID").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Entry(frame, textvariable=self.openai_client_id_var).grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-        ttk.Label(frame, text="OpenAI OAuth Audience").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(frame, text="OpenAI API Key").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
+        api_key_entry = ttk.Entry(frame, textvariable=self.api_key_var, show="•")
+        api_key_entry.grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        # Keep this direct-key option visible so users can quickly use remote models without OAuth setup.
+        self._attach_tooltip(
+            api_key_entry,
+            "Paste a standard OpenAI API key here for remote mode. Leave empty if you prefer OAuth Connect.",
+        )
+
+        ttk.Label(frame, text="OpenAI OAuth Client ID").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Entry(frame, textvariable=self.openai_client_id_var).grid(row=4, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        ttk.Label(frame, text="OpenAI OAuth Audience").grid(row=5, column=0, sticky="w", padx=8, pady=(8, 0))
         audience_entry = ttk.Entry(frame, textvariable=self.openai_audience_var)
-        audience_entry.grid(row=4, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        audience_entry.grid(row=5, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
         self._attach_tooltip(audience_entry, "Usually api.openai.com. Leave default unless OpenAI support says otherwise.")
-        ttk.Label(frame, text="OpenAI Redirect URI").grid(row=5, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(frame, text="OpenAI Redirect URI").grid(row=6, column=0, sticky="w", padx=8, pady=(8, 0))
         redirect_entry = ttk.Entry(frame, textvariable=self.openai_redirect_uri_var)
-        redirect_entry.grid(row=5, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        redirect_entry.grid(row=6, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
         self._attach_tooltip(
             redirect_entry,
             "Must match your OpenAI app exactly (e.g. http://127.0.0.1:8765/oauth/callback).",
@@ -2051,10 +2060,10 @@ class App(tk.Tk):
             frame,
             text="Tip: Set OPENAI_OAUTH_CLIENT_ID env var to prefill this automatically.",
             foreground="#666",
-        ).grid(row=6, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
+        ).grid(row=7, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
 
         oauth_controls = ttk.Frame(frame)
-        oauth_controls.grid(row=7, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        oauth_controls.grid(row=8, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
         self.oauth_connect_button = ttk.Button(oauth_controls, text="🔐 Connect OpenAI", command=self._start_openai_oauth_login)
         self.oauth_connect_button.pack(side=tk.LEFT)
         self.oauth_disconnect_button = ttk.Button(oauth_controls, text="🧹 Forget Token", command=self._clear_openai_token)
@@ -2067,19 +2076,19 @@ class App(tk.Tk):
         oauth_setup_button.pack(side=tk.LEFT, padx=(6, 0))
         self._attach_tooltip(oauth_setup_button, "Open OpenAI docs/settings to create or find your OAuth Client ID.")
 
-        ttk.Label(frame, text="Token Status").grid(row=7, column=0, sticky="w", padx=8, pady=(8, 0))
-        self.oauth_status_label = ttk.Label(frame, text="Not connected", foreground="#666")
-        self.oauth_status_label.grid(row=8, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
+        ttk.Label(frame, text="Credential Status").grid(row=8, column=0, sticky="w", padx=8, pady=(8, 0))
+        self.oauth_status_label = ttk.Label(frame, text="No credential configured", foreground="#666")
+        self.oauth_status_label.grid(row=9, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
 
-        ttk.Label(frame, text="⏱️ AI timeout (sec)").grid(row=9, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(frame, text="⏱️ AI timeout (sec)").grid(row=10, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Spinbox(frame, from_=30, to=3600, increment=30, textvariable=self.ai_timeout_seconds_var, width=10).grid(
-            row=9, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
+            row=10, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
         )
         ttk.Label(
             frame,
-            text="Tip: Connect OpenAI launches browser OAuth and returns here automatically (no token copy/paste).",
+            text="Tip: Use either an API key (quickest) or Connect OpenAI OAuth (browser login).",
             foreground="#666",
-        ).grid(row=10, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
+        ).grid(row=11, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
 
         self._handle_mode_change()
         self._refresh_oauth_status_label()
@@ -2217,8 +2226,9 @@ class App(tk.Tk):
 
         if self.provider_mode_var.get().startswith("Remote") and not self.api_key_var.get().strip():
             messagebox.showwarning(
-                "OpenAI OAuth required",
-                "Connect OpenAI first. Remote usage requires an OpenAI account: "
+                "Remote credential required",
+                "Add an OpenAI API key or connect with OpenAI OAuth first. "
+                "Remote usage requires an OpenAI account: "
                 f"{OPENAI_REGISTRATION_URL}",
             )
             return
