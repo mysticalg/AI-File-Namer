@@ -85,6 +85,16 @@ class FilenameUtilsTests(unittest.TestCase):
         self.assertEqual(value, "A Very Descriptive Filename For A Coasta")
         self.assertLessEqual(len(value), 40)
 
+    def test_sanitize_filename_stem_supports_natural_language_case(self):
+        raw = "A visual representation of United States against United Kingdom's empire"
+        value = sanitize_filename_stem(raw, separator=" ", capitalization="natural", max_length=120)
+        self.assertEqual(value, "A visual representation of United States against United Kingdom's empire")
+
+    def test_sanitize_filename_stem_supports_natural_language_with_underscores(self):
+        raw = "United Kingdom's map overview"
+        value = sanitize_filename_stem(raw, separator="_", capitalization="natural", max_length=120)
+        self.assertEqual(value, "United_Kingdom's_map_overview")
+
     def test_append_hashtags_respects_max_length(self):
         result = append_hashtags("My Song Name", separator=" ", hashtag_count=3, max_length=22)
         self.assertLessEqual(len(result), 22)
@@ -240,9 +250,10 @@ class FilenameUtilsTests(unittest.TestCase):
             ]
 
             suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
-            self.assertEqual(len(suggestions), 1)
-            self.assertEqual(suggestions[0].item_type, "folder")
-            self.assertIn("Music", suggestions[0].target_relative)
+            # Invalid path is filtered, while valid folder+file operations are preserved.
+            self.assertEqual(len(suggestions), 2)
+            self.assertEqual(sorted(item.item_type for item in suggestions), ["file", "folder"])
+            self.assertTrue(all("Music" in item.target_relative for item in suggestions))
 
     def test_normalize_ai_source_relative_path_strips_root_prefix(self):
         root = Path("/tmp/Bach")
@@ -366,7 +377,7 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertEqual(len(suggestions), 1)
             self.assertEqual(suggestions[0].target_relative, "Music/Vocal/Acapella/Artists Alphabetical/0")
 
-    def test_sanitize_restructure_operations_ignores_file_operations(self):
+    def test_sanitize_restructure_operations_supports_file_operations(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             folder = root / "media"
@@ -386,9 +397,34 @@ class FilenameUtilsTests(unittest.TestCase):
             ]
 
             suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
-            self.assertEqual(suggestions, [])
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0].item_type, "file")
+            self.assertEqual(suggestions[0].target_relative, "video/clips/clip.mp4")
 
-    def test_build_folder_inventory_returns_folder_only_payload(self):
+    def test_sanitize_restructure_operations_supports_file_rename_destination(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            folder = root / "media"
+            folder.mkdir()
+            (folder / "clip.mp4").write_text("x")
+
+            preferences = FilenamePreferences(
+                separator="_",
+                capitalization="lower",
+                max_filename_length=96,
+                max_folder_name_length=32,
+                include_hashtags=False,
+                hashtag_count=3,
+            )
+            operations = [
+                {"type": "file", "source": "media/clip.mp4", "destination": "video/highlights/my best clip.mp4"},
+            ]
+
+            suggestions = sanitize_restructure_operations(operations, root=root, preferences=preferences)
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0].target_relative, "video/highlights/my_best_clip.mp4")
+
+    def test_build_folder_inventory_returns_compact_tree_payload(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             (root / "photos" / "travel").mkdir(parents=True)
@@ -400,14 +436,26 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertEqual(inventory["root"], root.name)
             self.assertIn("root_full_path", inventory)
             self.assertIn("root_parent_name", inventory)
-            self.assertNotIn("files", inventory)
-            self.assertNotIn("file_count", inventory)
+            self.assertIn("file_paths", inventory)
+            self.assertIn("total_file_count", inventory)
+            self.assertIn("photos/image1.jpg", inventory["file_paths"])
             self.assertIn("folder_paths", inventory)
             self.assertGreaterEqual(len(inventory["folder_paths"]), 3)
             self.assertEqual(inventory["total_folder_count"], len(inventory["folder_paths"]))
             self.assertIn("direct_children", inventory)
             self.assertIn("photos", inventory["direct_children"])
             self.assertEqual(sorted(inventory["direct_children"]["photos"]), ["family", "travel"])
+
+    def test_build_folder_inventory_honors_sampling_limits(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            for idx in range(6):
+                (root / f"folder_{idx}").mkdir(parents=True)
+                (root / f"folder_{idx}" / f"file_{idx}.jpg").write_text("x")
+
+            inventory = build_folder_inventory(root, recursive=True, max_nodes=3, max_files=2)
+            self.assertLessEqual(len(inventory["folder_paths"]), 3)
+            self.assertLessEqual(len(inventory["file_paths"]), 2)
 
     def test_format_restructure_preview_paths_outputs_old_new_and_transition(self):
         old_path, new_path, transition = format_restructure_preview_paths(
@@ -522,6 +570,31 @@ class FilenameUtilsTests(unittest.TestCase):
         plan = extract_restructure_plan(payload)
         self.assertIn("operations", plan)
         self.assertEqual(len(plan["operations"]), 2)
+
+    def test_extract_restructure_plan_supports_single_operation_shape(self):
+        payload = {
+            "response": """```json
+{
+  "operation": "folder",
+  "source": "Bach",
+  "destination": "Classical/Bach"
+}
+```"""
+        }
+        plan = extract_restructure_plan(payload)
+        self.assertIn("operations", plan)
+        self.assertEqual(len(plan["operations"]), 1)
+        self.assertEqual(plan["operations"][0]["type"], "folder")
+
+    def test_extract_partial_restructure_operations_supports_operation_key(self):
+        raw = """{
+  "operation": "file",
+  "source": "old/song.mid",
+  "destination": "classical/Bach/song.mid"
+}"""
+        ops = extract_partial_restructure_operations(raw)
+        self.assertEqual(len(ops), 1)
+        self.assertEqual(ops[0]["type"], "file")
 
 
 if __name__ == "__main__":

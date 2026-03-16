@@ -36,14 +36,20 @@ DEFAULT_REMOTE_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 DEFAULT_LOCAL_MODEL = "llava"
 DEFAULT_REMOTE_MODEL = "gpt-4o-mini"
 DEFAULT_AI_TIMEOUT_SECONDS = 120
-DEFAULT_OPENAI_OAUTH_CLIENT_ID = "change-me-openai-oauth-client-id"
+DEFAULT_OPENAI_OAUTH_CLIENT_ID = os.environ.get("OPENAI_OAUTH_CLIENT_ID", "")
 DEFAULT_OPENAI_OAUTH_AUTH_URL = "https://auth.openai.com/oauth/authorize"
 DEFAULT_OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
-DEFAULT_OPENAI_OAUTH_SCOPE = "openid profile offline_access"
+DEFAULT_OPENAI_OAUTH_SCOPE = "openid profile email offline_access"
+DEFAULT_OPENAI_OAUTH_AUDIENCE = os.environ.get("OPENAI_OAUTH_AUDIENCE", "api.openai.com")
 DEFAULT_OPENAI_OAUTH_REDIRECT_HOST = "127.0.0.1"
 DEFAULT_OPENAI_OAUTH_REDIRECT_PORT = 8765
+DEFAULT_OPENAI_OAUTH_REDIRECT_URI = os.environ.get(
+    "OPENAI_OAUTH_REDIRECT_URI",
+    f"http://{DEFAULT_OPENAI_OAUTH_REDIRECT_HOST}:{DEFAULT_OPENAI_OAUTH_REDIRECT_PORT}/oauth/callback",
+)
 OLLAMA_DOWNLOAD_URL = "https://ollama.com/download"
 OPENAI_REGISTRATION_URL = "https://platform.openai.com/signup"
+OPENAI_OAUTH_APP_SETUP_URL = "https://platform.openai.com/settings/organization/general"
 
 
 def default_settings_path() -> Path:
@@ -87,6 +93,15 @@ def clamp_ai_timeout_seconds(value: Any) -> int:
     return max(30, min(parsed, 3600))
 
 
+def describe_capitalization_mode(mode: str) -> str:
+    """Return human-readable wording for naming-style instructions sent to the model."""
+    if mode == "title":
+        return "Title Case words"
+    if mode == "natural":
+        return "natural sentence-style wording"
+    return "lowercase words"
+
+
 def _pkce_code_challenge(verifier: str) -> str:
     """Build an RFC-7636 PKCE code challenge from a verifier string."""
     digest = hashlib.sha256(verifier.encode("utf-8")).digest()
@@ -124,28 +139,47 @@ class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
 class OpenAIOAuthClient:
     """Handle OpenAI OAuth login and token exchange for desktop app sessions."""
 
-    def __init__(self, client_id: str, auth_url: str, token_url: str, scope: str):
+    def __init__(
+        self,
+        client_id: str,
+        auth_url: str,
+        token_url: str,
+        scope: str,
+        redirect_uri: str,
+        audience: str,
+    ):
         self.client_id = client_id.strip()
         self.auth_url = auth_url.strip()
         self.token_url = token_url.strip()
         self.scope = scope.strip()
+        self.redirect_uri = redirect_uri.strip() or DEFAULT_OPENAI_OAUTH_REDIRECT_URI
+        self.audience = audience.strip()
 
     def authorize(self, timeout_seconds: int = 180) -> Dict[str, Any]:
         """Run OAuth Authorization Code + PKCE flow and return token payload."""
         import requests
 
-        if not self.client_id or self.client_id == DEFAULT_OPENAI_OAUTH_CLIENT_ID:
-            raise ValueError("Set your OpenAI OAuth Client ID before connecting.")
+        if not self.client_id:
+            raise ValueError(
+                "OpenAI OAuth Client ID is missing. Add it in AI Provider settings or set OPENAI_OAUTH_CLIENT_ID."
+            )
+        if not self.client_id.startswith("app_"):
+            raise ValueError("OpenAI OAuth Client ID should start with 'app_'.")
 
-        redirect_uri = (
-            f"http://{DEFAULT_OPENAI_OAUTH_REDIRECT_HOST}:{DEFAULT_OPENAI_OAUTH_REDIRECT_PORT}/oauth/callback"
-        )
+        parsed_redirect = urllib.parse.urlparse(self.redirect_uri)
+        if parsed_redirect.scheme != "http" or not parsed_redirect.hostname or not parsed_redirect.port:
+            raise ValueError(
+                "OpenAI redirect URI must be an http://127.0.0.1:<port>/path style local callback URL."
+            )
+        if parsed_redirect.hostname not in {"127.0.0.1", "localhost"}:
+            raise ValueError("OpenAI redirect URI host must be 127.0.0.1 or localhost for desktop callback flow.")
+        redirect_uri = self.redirect_uri
         verifier = secrets.token_urlsafe(64)
         state = secrets.token_urlsafe(24)
         challenge = _pkce_code_challenge(verifier)
 
         with http.server.ThreadingHTTPServer(
-            (DEFAULT_OPENAI_OAUTH_REDIRECT_HOST, DEFAULT_OPENAI_OAUTH_REDIRECT_PORT),
+            (parsed_redirect.hostname, parsed_redirect.port),
             _OAuthCallbackHandler,
         ) as callback_server:
             callback_server.timeout = timeout_seconds
@@ -160,6 +194,7 @@ class OpenAIOAuthClient:
                     "state": state,
                     "code_challenge": challenge,
                     "code_challenge_method": "S256",
+                    **({"audience": self.audience} if self.audience else {}),
                 }
             )
             auth_link = f"{self.auth_url}?{query}"
@@ -168,7 +203,11 @@ class OpenAIOAuthClient:
             result = getattr(callback_server, "auth_result", None)
 
         if not isinstance(result, dict):
-            raise RuntimeError("Timed out waiting for OpenAI authorization callback.")
+            raise RuntimeError(
+                "Timed out waiting for OpenAI OAuth callback. "
+                "This usually means the app Client ID/Redirect URI pair is not configured correctly in OpenAI. "
+                f"Current redirect URI: {redirect_uri}"
+            )
         if result.get("state") != state:
             raise RuntimeError("OAuth state mismatch detected. Please try again.")
         if "error" in result:
@@ -307,7 +346,7 @@ class AIProvider:
         import requests
 
         style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
-        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        case_description = describe_capitalization_mode(preferences.capitalization)
         hashtag_description = (
             f" Append up to {preferences.hashtag_count} short hashtags at the end."
             if preferences.include_hashtags and preferences.hashtag_count > 0
@@ -410,7 +449,7 @@ class AIProvider:
 
         listed_items = ", ".join(child_entries[:40]) if child_entries else "empty_folder"
         style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
-        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        case_description = describe_capitalization_mode(preferences.capitalization)
         prompt = (
             "Return only a concise folder name based on these entries. "
             f"Use {style_description} and {case_description}. "
@@ -484,7 +523,7 @@ class AIProvider:
 
         listed_items = ", ".join(child_entries[:40]) if child_entries else "empty_folder"
         style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
-        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        case_description = describe_capitalization_mode(preferences.capitalization)
         prompt = (
             "Return only a category path for organizing this folder. "
             "Use 1 to 3 path segments separated by '/'. "
@@ -553,30 +592,31 @@ class AIProvider:
         preferences: FilenamePreferences,
         extra_instruction: str = "",
     ) -> Dict[str, object]:
-        """Request a full-tree folder-only restructure plan.
+        """Request a full-tree folder+file restructure plan.
 
         The planner works from the root inventory in one pass and returns a complete
-        folder path proposal rather than recursively planning each subtree.
+        path proposal rather than recursively planning each subtree.
         """
         import requests
 
         style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
-        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        case_description = describe_capitalization_mode(preferences.capitalization)
         prompt = (
             "You are organizing a messy folder tree. "
             "Primary goal: consolidate and simplify the tree so it has fewer, clearer folders. "
             "Use root context (root name, parent name, and full root path) to infer domain and naming intent. "
             "For example, if context suggests Music/Artist/Bach, expand cryptic catalog labels into meaningful work names when confident. "
             "Return JSON only with shape: "
-            "{\"operations\": [{\"type\": \"folder\", \"source\": \"relative/path\", \"destination\": \"relative/parent/path\"}], "
+            "{\"operations\": [{\"type\": \"folder\"|\"file\", \"source\": \"relative/path\", \"destination\": \"relative/path\"}], "
             "\"reorganized_structure\": [\"relative/final/folder/path\"], "
             "\"dedupe_files\": true}. "
-            "Only include folder operations, never file operations. "
-            "Destination is the target parent path, not final file/folder name. "
+            "For folder operations: destination is the target parent path (not final folder name). "
+            "For file operations: destination may be a target folder path or a full new file path including a renamed filename. "
             "The reorganized_structure list must represent the full final folder tree from the root. "
             "Plan once from the root inventory (do not recursively re-plan each subfolder). "
             "Use shallow logical categories and consolidate duplicates. "
             "Avoid over-nesting and avoid creating one-off folders when an existing shared category works. "
+            "Use file extensions to infer media/document categories and improve consistency of file naming. "
             f"Use {style_description} and {case_description}. "
             "Do not include markdown. "
             "Every source folder should appear exactly once in operations (unless intentionally unchanged). "
@@ -710,7 +750,7 @@ def extract_json_object(raw: str) -> Dict[str, object]:
 
 
 def extract_partial_restructure_operations(raw_text: str) -> List[Dict[str, str]]:
-    """Recover folder operations from partially truncated model output.
+    """Recover move operations from partially truncated model output.
 
     This fallback is used when the model returns incomplete JSON (for example a
     long `operations` list that is cut off before the final closing braces).
@@ -725,16 +765,20 @@ def extract_partial_restructure_operations(raw_text: str) -> List[Dict[str, str]
 
     for obj_text in object_pattern.findall(normalized):
         type_match = re.search(r'"type"\s*:\s*"([^"]+)"', obj_text)
+        if not type_match:
+            # Some models return `operation` instead of `type` for single-item payloads.
+            type_match = re.search(r'"operation"\s*:\s*"([^"]+)"', obj_text)
         source_match = re.search(r'"source"\s*:\s*"([^"]+)"', obj_text)
         destination_match = re.search(r'"destination"\s*:\s*"([^"]+)"', obj_text)
         if not type_match or not source_match or not destination_match:
             continue
-        if type_match.group(1).strip().lower() != "folder":
+        operation_type = type_match.group(1).strip().lower()
+        if operation_type not in {"folder", "file"}:
             continue
 
         operations.append(
             {
-                "type": "folder",
+                "type": operation_type,
                 "source": source_match.group(1).strip(),
                 "destination": destination_match.group(1).strip(),
             }
@@ -759,6 +803,28 @@ def extract_restructure_plan(raw: object, max_depth: int = 6) -> Dict[str, objec
             operations = value.get("operations")
             if isinstance(operations, list):
                 return value
+            if isinstance(operations, dict):
+                # Some models return a single operation object instead of an array.
+                normalized = dict(value)
+                normalized["operations"] = [operations]
+                return normalized
+
+            # Accept one-operation variants using `operation` + `source` + `destination`.
+            op_variant = str(value.get("operation", value.get("type", ""))).strip().lower()
+            source = value.get("source")
+            destination = value.get("destination")
+            if op_variant in {"folder", "file"} and isinstance(source, str) and isinstance(destination, str):
+                return {
+                    "operations": [
+                        {
+                            "type": op_variant,
+                            "source": source,
+                            "destination": destination,
+                        }
+                    ],
+                    "dedupe_files": bool(value.get("dedupe_files", True)),
+                    "reorganized_structure": value.get("reorganized_structure", []),
+                }
 
             for key in ("response", "message", "content", "output", "text"):
                 nested = value.get(key)
@@ -857,16 +923,23 @@ def build_ollama_missing_guidance(error_text: str) -> str:
     return "Could not fetch Ollama models. You can still type a model manually."
 
 
-def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
-    """Build a compact folder-only representation for AI restructure planning.
+def build_folder_inventory(
+    folder: Path,
+    recursive: bool,
+    max_nodes: int = 240,
+    max_files: int = 420,
+) -> Dict[str, object]:
+    """Build a compact folder+file representation for AI restructure planning.
 
     The payload intentionally avoids redundant per-row keys so AI requests stay
     small and fast while still preserving enough tree context to plan moves.
     """
     folders = collect_subfolders(folder, recursive=recursive)
-    max_nodes = 240
+    files = sorted(path for path in folder.glob("**/*" if recursive else "*") if path.is_file())
     folder_paths = [str(path.relative_to(folder)).replace("\\", "/") for path in folders]
     sampled_paths = folder_paths[:max_nodes]
+    file_paths = [str(path.relative_to(folder)).replace("\\", "/") for path in files]
+    sampled_files = file_paths[:max_files]
     direct_children_map: Dict[str, List[str]] = {}
     for subfolder in folders[:max_nodes]:
         rel = str(subfolder.relative_to(folder)).replace("\\", "/")
@@ -882,8 +955,11 @@ def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
         "root_parent_name": folder.parent.name,
         # One list of relative folder paths is enough to describe restructure sources.
         "folder_paths": sampled_paths,
+        # Include sampled file paths so the planner can suggest tidy file/folder moves too.
+        "file_paths": sampled_files,
         # Root-level cardinality helps the model estimate plan scope without row bloat.
         "total_folder_count": len(folders),
+        "total_file_count": len(files),
         # Optional child hints preserve local hierarchy without repeating each folder row.
         "direct_children": direct_children_map,
     }
@@ -942,7 +1018,12 @@ def sanitize_restructure_operations(
     root: Path,
     preferences: FilenamePreferences,
 ) -> List[FolderStructureSuggestion]:
-    """Validate and sanitize AI-proposed operations into executable move suggestions."""
+    """Validate and sanitize AI-proposed operations into executable move suggestions.
+
+    Supports both folder and file operations. Folder destinations are treated as
+    parent paths. File destinations may be either parent folders or full file
+    targets with a renamed filename.
+    """
 
     def _normalize_segment_for_compare(segment: str) -> str:
         """Create a stable comparison key for path-segment equality checks."""
@@ -958,7 +1039,7 @@ def sanitize_restructure_operations(
         source_raw = str(operation.get("source", "")).strip().replace("\\", "/")
         destination_raw = str(operation.get("destination", "")).strip().replace("\\", "/")
         item_type = str(operation.get("type", "folder")).strip().lower()
-        if not source_raw or item_type != "folder":
+        if not source_raw or item_type not in {"folder", "file"}:
             continue
 
         source_rel = normalize_ai_source_relative_path(source_raw, root)
@@ -972,37 +1053,82 @@ def sanitize_restructure_operations(
             continue
         if not source_path.exists():
             continue
+        if item_type == "folder" and not source_path.is_dir():
+            continue
+        if item_type == "file" and not source_path.is_file():
+            continue
 
-        # destination is a parent path for the source item; blank means move to root.
+        # destination is a parent path for folders; for files we also accept a full
+        # file path including a renamed leaf name.
         sanitized_destination_parent = normalize_ai_destination_relative_path(
             destination_raw=destination_raw,
             root=root,
             preferences=preferences,
         )
-        source_name = sanitize_filename_stem(
-            source_path.name,
-            separator=preferences.separator,
-            capitalization=preferences.capitalization,
-            max_length=preferences.max_folder_name_length,
-        )
-        if not source_name:
-            source_name = source_path.name
+        destination_raw_clean = destination_raw.strip().replace("\\", "/").strip("/")
+        if destination_raw_clean.startswith(f"{root.name}/"):
+            destination_raw_clean = destination_raw_clean[len(root.name) + 1 :]
+        if item_type == "file":
+            stem_budget = max(1, preferences.max_filename_length - len(source_path.suffix))
+            normalized_stem = sanitize_filename_stem(
+                source_path.stem,
+                separator=preferences.separator,
+                capitalization=preferences.capitalization,
+                max_length=stem_budget,
+            )
+            source_name = f"{normalized_stem or source_path.stem}{source_path.suffix.lower()}"
+        else:
+            source_name = sanitize_filename_stem(
+                source_path.name,
+                separator=preferences.separator,
+                capitalization=preferences.capitalization,
+                max_length=preferences.max_folder_name_length,
+            )
+            if not source_name:
+                source_name = source_path.name
 
-        # Some models ignore the "destination is a parent path" requirement and
-        # return a full target path that already includes the source folder name.
-        # Detect that case so we do not append the name twice (e.g. Cache/Cache).
+        # Some models return full target paths while others return parent paths.
+        # Detect and normalize both styles while preserving safe naming.
         target_relative = source_name
         if sanitized_destination_parent:
             destination_parts = [part for part in Path(sanitized_destination_parent).parts if part not in (".", "..")]
             destination_tail = destination_parts[-1] if destination_parts else ""
-            if destination_tail and _normalize_segment_for_compare(destination_tail) == _normalize_segment_for_compare(source_name):
+            if item_type == "folder" and destination_tail and _normalize_segment_for_compare(destination_tail) == _normalize_segment_for_compare(source_name):
                 target_relative = "/".join(destination_parts)
+            elif item_type == "file" and destination_raw_clean.lower().endswith(source_path.suffix.lower()):
+                # For files, a destination that includes an extension is treated as full file target.
+                raw_parts = [part for part in Path(destination_raw_clean).parts if part not in (".", "..")]
+                raw_tail = raw_parts[-1] if raw_parts else destination_tail
+                normalized_file_name = sanitize_filename_stem(
+                    Path(raw_tail).stem,
+                    separator=preferences.separator,
+                    capitalization=preferences.capitalization,
+                    max_length=max(1, preferences.max_filename_length - len(source_path.suffix)),
+                )
+                if not normalized_file_name:
+                    normalized_file_name = source_path.stem
+                file_leaf = f"{normalized_file_name}{source_path.suffix.lower()}"
+                sanitized_parent_parts = [
+                    sanitize_filename_stem(
+                        part,
+                        separator=preferences.separator,
+                        capitalization=preferences.capitalization,
+                        max_length=preferences.max_folder_name_length,
+                    )
+                    or part
+                    for part in raw_parts[:-1]
+                ]
+                target_relative = "/".join([*sanitized_parent_parts, file_leaf])
             else:
                 target_relative = "/".join([*destination_parts, source_name])
 
         # Extra safety net: collapse accidental duplicate trailing segments.
         target_parts = [part for part in Path(target_relative).parts if part not in (".", "..")]
-        while len(target_parts) >= 2 and _normalize_segment_for_compare(target_parts[-1]) == _normalize_segment_for_compare(target_parts[-2]):
+        while (
+            item_type == "folder"
+            and len(target_parts) >= 2
+            and _normalize_segment_for_compare(target_parts[-1]) == _normalize_segment_for_compare(target_parts[-2])
+        ):
             target_parts.pop()
         target_relative = "/".join(target_parts) or source_name
 
@@ -1032,17 +1158,27 @@ def sanitize_filename_stem(
     The returned value honors user preferences for separators/capitalization and
     trims to the requested maximum character count.
     """
-    cleaned = raw.strip().lower()
-    cleaned = re.sub(r"[`'\"\n\r]", " ", cleaned)
-    cleaned = re.sub(r"[^a-z0-9_\-\s]", " ", cleaned)
-    cleaned = cleaned.replace("-", " ")
-    cleaned = re.sub(r"\s+", separator, cleaned)
-    cleaned = cleaned.strip(" _.")
-    cleaned = "".join(ch for ch in cleaned if ch not in INVALID_FILENAME_CHARS)
-    if capitalization == "title":
-        # Preserve chosen separator while capitalizing each token for readability.
-        tokens = [token.capitalize() for token in cleaned.split(separator) if token]
-        cleaned = separator.join(tokens)
+    if capitalization == "natural":
+        # Natural mode preserves model wording/case while still enforcing Windows safety.
+        cleaned = raw.strip().replace("\n", " ").replace("\r", " ")
+        cleaned = cleaned.replace("_", " ").replace("-", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" _.")
+        cleaned = "".join(ch for ch in cleaned if ch not in INVALID_FILENAME_CHARS and ch.isprintable())
+        if separator == "_":
+            cleaned = re.sub(r"\s+", "_", cleaned)
+        cleaned = cleaned.strip(" _.")
+    else:
+        cleaned = raw.strip().lower()
+        cleaned = re.sub(r"[`'\"\n\r]", " ", cleaned)
+        cleaned = re.sub(r"[^a-z0-9_\-\s]", " ", cleaned)
+        cleaned = cleaned.replace("-", " ")
+        cleaned = re.sub(r"\s+", separator, cleaned)
+        cleaned = cleaned.strip(" _.")
+        cleaned = "".join(ch for ch in cleaned if ch not in INVALID_FILENAME_CHARS)
+        if capitalization == "title":
+            # Preserve chosen separator while capitalizing each token for readability.
+            tokens = [token.capitalize() for token in cleaned.split(separator) if token]
+            cleaned = separator.join(tokens)
     return cleaned[:max(1, max_length)]
 
 
@@ -1220,6 +1356,8 @@ class App(tk.Tk):
         self.openai_auth_url_var = tk.StringVar(value=str(loaded_settings.get("openai_auth_url", DEFAULT_OPENAI_OAUTH_AUTH_URL)))
         self.openai_token_url_var = tk.StringVar(value=str(loaded_settings.get("openai_token_url", DEFAULT_OPENAI_OAUTH_TOKEN_URL)))
         self.openai_scope_var = tk.StringVar(value=str(loaded_settings.get("openai_scope", DEFAULT_OPENAI_OAUTH_SCOPE)))
+        self.openai_audience_var = tk.StringVar(value=str(loaded_settings.get("openai_audience", DEFAULT_OPENAI_OAUTH_AUDIENCE)))
+        self.openai_redirect_uri_var = tk.StringVar(value=str(loaded_settings.get("openai_redirect_uri", DEFAULT_OPENAI_OAUTH_REDIRECT_URI)))
         self.include_date_var = tk.BooleanVar(value=bool(loaded_settings.get("include_date", False)))
         self.recursive_scan_var = tk.BooleanVar(value=bool(loaded_settings.get("recursive_scan", True)))
         self.recursive_folder_rename_var = tk.BooleanVar(value=bool(loaded_settings.get("recursive_folder_rename", True)))
@@ -1235,6 +1373,9 @@ class App(tk.Tk):
         self.dedupe_keep_var = tk.StringVar(value=str(loaded_settings.get("dedupe_keep", "Keep first match")))
         self.ai_timeout_seconds_var = tk.IntVar(value=clamp_ai_timeout_seconds(loaded_settings.get("ai_timeout_seconds", DEFAULT_AI_TIMEOUT_SECONDS)))
         self.status_var = tk.StringVar(value="Choose a folder and generate AI suggestions.")
+        # Compact card summaries keep active configuration visible on the main window.
+        self.provider_card_summary_var = tk.StringVar(value="")
+        self.naming_card_summary_var = tk.StringVar(value="")
 
         # Store per-provider endpoint/model preferences so mode switches don't erase user values.
         self.local_endpoint = str(loaded_settings.get("local_endpoint", DEFAULT_LOCAL_ENDPOINT))
@@ -1250,13 +1391,22 @@ class App(tk.Tk):
         self.rename_history: List[Tuple[Path, Path]] = []
         self.folder_rename_history: List[Tuple[Path, Path]] = []
         self.ui_queue: queue.Queue = queue.Queue()
-        self.folder_row_paths: Dict[str, Path] = {}
+        # Per-row filesystem targets used by the right-click context menu.
+        # For file suggestions we store the containing folder; for folder rows we store that folder.
+        self.row_open_paths: Dict[str, Path] = {}
+        # Keep thumbnail image references alive for Treeview rows (Tkinter drops images if unreferenced).
+        self.row_thumbnail_images: Dict[str, tk.PhotoImage] = {}
         self.sort_state: Dict[str, bool] = {}
         self.debug_events: List[str] = []
         self.debug_window: Optional[tk.Toplevel] = None
         self.debug_text: Optional[tk.Text] = None
         self.ollama_models: List[str] = []
         self.oauth_in_progress = False
+        # Dialog widget references are optional because settings now live in popup windows.
+        self.model_combo: Optional[ttk.Combobox] = None
+        self.oauth_connect_button: Optional[ttk.Button] = None
+        self.oauth_disconnect_button: Optional[ttk.Button] = None
+        self.oauth_status_label: Optional[ttk.Label] = None
         self._settings_ready = False
 
         self._build_ui()
@@ -1283,6 +1433,15 @@ class App(tk.Tk):
         ttk.Button(source_frame, text="Browse", command=self._select_folder).grid(row=0, column=2, padx=4, pady=8)
         ttk.Button(source_frame, text="Scan + Suggest", command=self._start_scan).grid(row=0, column=3, padx=4, pady=8)
         ttk.Button(source_frame, text="🪵 AI Debug", command=self._open_debug_window).grid(row=0, column=4, padx=(4, 8), pady=8)
+        settings_button = ttk.Menubutton(source_frame, text="⚙️ Settings ▾")
+        settings_button.grid(row=0, column=5, padx=(0, 8), pady=8)
+        self._attach_tooltip(settings_button, "Open AI Provider and Naming Rules settings.")
+
+        # A compact top dropdown keeps the main workflow uncluttered while exposing advanced controls.
+        settings_menu = tk.Menu(settings_button, tearoff=0)
+        settings_menu.add_command(label="🧠 AI Provider", command=self._open_ai_provider_settings)
+        settings_menu.add_command(label="✍️ Naming Rules", command=self._open_naming_rules_settings)
+        settings_button.configure(menu=settings_menu)
 
         ttk.Checkbutton(
             source_frame,
@@ -1295,143 +1454,42 @@ class App(tk.Tk):
             foreground="#666",
         ).grid(row=1, column=2, columnspan=3, sticky="w", pady=(0, 8))
 
-        # 2) AI section: provider, endpoint, model and auth grouped together.
-        ai_frame = ttk.LabelFrame(top, text="🧠 AI Provider")
-        ai_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0), padx=(0, 6))
-        ai_frame.columnconfigure(1, weight=1)
-
-        ttk.Label(ai_frame, text="Mode").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
-        mode_combo = ttk.Combobox(
-            ai_frame,
-            textvariable=self.provider_mode_var,
-            values=["Local (Ollama /api/generate)", "Remote (OpenAI-compatible /v1/chat/completions)"],
-            state="readonly",
-        )
-        mode_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-        mode_combo.bind("<<ComboboxSelected>>", lambda _: self._handle_mode_change())
-
-        ttk.Label(ai_frame, text="Endpoint").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Entry(ai_frame, textvariable=self.endpoint_var).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-
-        ttk.Label(ai_frame, text="Model").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
-        model_row = ttk.Frame(ai_frame)
-        model_row.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-        model_row.columnconfigure(0, weight=1)
-        self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var)
-        self.model_combo.grid(row=0, column=0, sticky="ew")
-        ttk.Button(
-            model_row,
-            text="↻ Fetch Ollama Models",
-            command=self._start_ollama_model_refresh,
-        ).grid(row=0, column=1, padx=(6, 0))
-
-        ttk.Label(ai_frame, text="OpenAI OAuth Client ID").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Entry(ai_frame, textvariable=self.openai_client_id_var).grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-
-        oauth_controls = ttk.Frame(ai_frame)
-        oauth_controls.grid(row=4, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
-        self.oauth_connect_button = ttk.Button(oauth_controls, text="🔐 Connect OpenAI", command=self._start_openai_oauth_login)
-        self.oauth_connect_button.pack(side=tk.LEFT)
-        self.oauth_disconnect_button = ttk.Button(
-            oauth_controls,
-            text="🧹 Forget Token",
-            command=self._clear_openai_token,
-        )
-        self.oauth_disconnect_button.pack(side=tk.LEFT, padx=(6, 0))
-
-        ttk.Label(ai_frame, text="Token Status").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
-        self.oauth_status_label = ttk.Label(ai_frame, text="Not connected", foreground="#666")
-        self.oauth_status_label.grid(row=5, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
-
-        ttk.Label(ai_frame, text="⏱️ AI timeout (sec)").grid(row=6, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Spinbox(
-            ai_frame,
-            from_=30,
-            to=3600,
-            increment=30,
-            textvariable=self.ai_timeout_seconds_var,
-            width=10,
-        ).grid(row=6, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
-
+        # 2) Compact settings cards: full configuration now opens from top settings dropdown.
+        provider_card = ttk.LabelFrame(top, text="🧠 AI Provider")
+        provider_card.grid(row=1, column=0, sticky="nsew", pady=(10, 0), padx=(0, 6))
+        provider_card.columnconfigure(0, weight=1)
         ttk.Label(
-            ai_frame,
-            text="Tip: Use OAuth Connect for OpenAI remote mode. Tokens are saved locally for reuse.",
+            provider_card,
+            text="Current provider in use:",
             foreground="#666",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
-
-        # 3) Naming section: filename/folder conventions together for predictability.
-        naming_frame = ttk.LabelFrame(top, text="✍️ Naming Rules")
-        naming_frame.grid(row=1, column=1, sticky="nsew", pady=(10, 0), padx=(6, 0))
-        naming_frame.columnconfigure(1, weight=1)
-
-        ttk.Checkbutton(
-            naming_frame,
-            text="Include date prefix",
-            variable=self.include_date_var,
-        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Label(naming_frame, text="Format").grid(row=0, column=1, sticky="e", padx=(0, 4), pady=(8, 0))
-        ttk.Entry(naming_frame, width=14, textvariable=self.date_format_var).grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
         ttk.Label(
-            naming_frame,
-            text="(strftime e.g. %Y-%m-%d)",
-            foreground="#666",
-        ).grid(row=0, column=3, sticky="w", padx=(0, 8), pady=(8, 0))
-
-        ttk.Label(naming_frame, text="Separator").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Combobox(
-            naming_frame,
-            width=18,
-            textvariable=self.word_separator_var,
-            state="readonly",
-            values=["Underscores (_)", "White spaces ( )"],
-        ).grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
-
-        ttk.Label(naming_frame, text="Case").grid(row=1, column=2, sticky="e", padx=(0, 4), pady=(8, 0))
-        ttk.Combobox(
-            naming_frame,
-            width=12,
-            textvariable=self.capitalization_var,
-            state="readonly",
-            values=["lowercase", "Title Case"],
-        ).grid(row=1, column=3, sticky="w", padx=(0, 8), pady=(8, 0))
-
-        ttk.Label(naming_frame, text="Max filename length").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Spinbox(
-            naming_frame,
-            from_=16,
-            to=MAX_WINDOWS_FILENAME_LENGTH,
-            width=6,
-            textvariable=self.max_filename_length_var,
-        ).grid(row=2, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+            provider_card,
+            textvariable=self.provider_card_summary_var,
+        ).grid(row=1, column=0, sticky="w", padx=8, pady=(0, 4))
         ttk.Label(
-            naming_frame,
-            text="Includes date + extension",
+            provider_card,
+            text="Open ⚙️ Settings ▾ → 🧠 AI Provider to change mode/model.",
             foreground="#666",
-        ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(8, 0))
+        ).grid(row=2, column=0, sticky="w", padx=8, pady=(0, 8))
 
-        ttk.Label(naming_frame, text="Max folder name length").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Spinbox(
-            naming_frame,
-            from_=8,
-            to=MAX_WINDOWS_FILENAME_LENGTH,
-            width=6,
-            textvariable=self.max_folder_name_length_var,
-        ).grid(row=3, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
-
-        ttk.Checkbutton(
-            naming_frame,
-            text="#️⃣ Include hashtags",
-            variable=self.include_hashtags_var,
-        ).grid(row=4, column=0, sticky="w", padx=8, pady=(8, 8))
-        ttk.Label(naming_frame, text="Count").grid(row=4, column=1, sticky="e", padx=(0, 4), pady=(8, 8))
-        ttk.Spinbox(naming_frame, from_=1, to=10, width=4, textvariable=self.hashtag_count_var).grid(
-            row=4, column=2, sticky="w", padx=(0, 8), pady=(8, 8)
-        )
+        naming_card = ttk.LabelFrame(top, text="✍️ Naming Rules")
+        naming_card.grid(row=1, column=1, sticky="nsew", pady=(10, 0), padx=(6, 0))
+        naming_card.columnconfigure(0, weight=1)
         ttk.Label(
-            naming_frame,
-            text="Hashtags stay inside your length limit.",
+            naming_card,
+            text="Current naming style:",
             foreground="#666",
-        ).grid(row=4, column=3, sticky="w", padx=(0, 8), pady=(8, 8))
+        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        ttk.Label(
+            naming_card,
+            textvariable=self.naming_card_summary_var,
+        ).grid(row=1, column=0, sticky="w", padx=8, pady=(0, 4))
+        ttk.Label(
+            naming_card,
+            text="Open ⚙️ Settings ▾ → ✍️ Naming Rules to adjust casing/separators.",
+            foreground="#666",
+        ).grid(row=2, column=0, sticky="w", padx=8, pady=(0, 8))
 
         # 4) Folder operations section: renaming, restructure, dedupe and cleanup.
         folder_ops_frame = ttk.LabelFrame(top, text="🗂️ Folder Operations")
@@ -1499,7 +1557,10 @@ class App(tk.Tk):
         table_wrapper.pack(fill=tk.BOTH, expand=True)
 
         cols = ("original", "suggestion", "final", "status")
-        self.tree = ttk.Treeview(table_wrapper, columns=cols, show="headings", selectmode="extended")
+        # Use the tree column (#0) to render image thumbnails while still keeping sortable headings.
+        self.tree = ttk.Treeview(table_wrapper, columns=cols, show="tree headings", selectmode="extended")
+        self.tree.heading("#0", text="Preview")
+        self.tree.column("#0", width=68, minwidth=56, anchor="center", stretch=False)
         # Clickable column headers for quick sorting while reviewing AI suggestions.
         self.tree.heading("original", text="Original", command=lambda: self._sort_tree_by_column("original"))
         self.tree.heading("suggestion", text="AI Suggestion", command=lambda: self._sort_tree_by_column("suggestion"))
@@ -1516,7 +1577,7 @@ class App(tk.Tk):
         # Right-click menu for folder suggestion rows for quick OS navigation/actions.
         self.folder_menu = tk.Menu(self, tearoff=0)
         self.folder_menu.add_command(
-            label="📂 Open Folder in Explorer",
+            label="📂 Open Containing Folder",
             command=self._open_selected_folder_in_explorer,
         )
         self.tree.bind("<Button-3>", self._show_row_context_menu)
@@ -1533,6 +1594,7 @@ class App(tk.Tk):
         ttk.Label(self, textvariable=self.status_var, padding=(12, 0, 12, 12), foreground="#005a9c").pack(anchor="w")
 
         self._handle_mode_change()
+        self._refresh_settings_card_summaries()
         self._refresh_oauth_status_label()
 
     def _capture_provider_fields_for_mode(self) -> None:
@@ -1557,6 +1619,8 @@ class App(tk.Tk):
             "openai_auth_url": self.openai_auth_url_var.get(),
             "openai_token_url": self.openai_token_url_var.get(),
             "openai_scope": self.openai_scope_var.get(),
+            "openai_audience": self.openai_audience_var.get(),
+            "openai_redirect_uri": self.openai_redirect_uri_var.get(),
             "include_date": self.include_date_var.get(),
             "recursive_scan": self.recursive_scan_var.get(),
             "recursive_folder_rename": self.recursive_folder_rename_var.get(),
@@ -1564,12 +1628,15 @@ class App(tk.Tk):
             "date_format": self.date_format_var.get(),
             "word_separator": self.word_separator_var.get(),
             "capitalization": self.capitalization_var.get(),
-            "max_filename_length": self.max_filename_length_var.get(),
-            "max_folder_name_length": self.max_folder_name_length_var.get(),
+            # Guard IntVar reads so transient empty Spinbox edits never crash autosave.
+            "max_filename_length": self._safe_int_var_get(self.max_filename_length_var, 96),
+            "max_folder_name_length": self._safe_int_var_get(self.max_folder_name_length_var, 96),
             "include_hashtags": self.include_hashtags_var.get(),
-            "hashtag_count": self.hashtag_count_var.get(),
+            "hashtag_count": self._safe_int_var_get(self.hashtag_count_var, 3),
             "dedupe_keep": self.dedupe_keep_var.get(),
-            "ai_timeout_seconds": clamp_ai_timeout_seconds(self.ai_timeout_seconds_var.get()),
+            "ai_timeout_seconds": clamp_ai_timeout_seconds(
+                self._safe_int_var_get(self.ai_timeout_seconds_var, DEFAULT_AI_TIMEOUT_SECONDS)
+            ),
             "local_endpoint": self.local_endpoint,
             "remote_endpoint": self.remote_endpoint,
             "local_model": self.local_model,
@@ -1581,6 +1648,17 @@ class App(tk.Tk):
         if not self._settings_ready:
             return
         save_app_settings(self._settings_snapshot(), self.settings_path)
+        self._refresh_settings_card_summaries()
+
+    def _refresh_settings_card_summaries(self) -> None:
+        """Refresh compact provider/naming summary text shown on the main window cards."""
+        mode_text = "Local" if self.provider_mode_var.get().startswith("Local") else "Remote"
+        active_model = self.model_var.get().strip() or (DEFAULT_LOCAL_MODEL if mode_text == "Local" else DEFAULT_REMOTE_MODEL)
+        self.provider_card_summary_var.set(f"{mode_text} mode • model: {active_model}")
+
+        separator_text = "spaces" if self.word_separator_var.get().startswith("White spaces") else "underscores"
+        case_text = self.capitalization_var.get()
+        self.naming_card_summary_var.set(f"{case_text} • {separator_text}")
 
     def _register_settings_traces(self) -> None:
         """Attach variable traces so every control change is automatically persisted."""
@@ -1594,6 +1672,8 @@ class App(tk.Tk):
             self.openai_auth_url_var,
             self.openai_token_url_var,
             self.openai_scope_var,
+            self.openai_audience_var,
+            self.openai_redirect_uri_var,
             self.include_date_var,
             self.recursive_scan_var,
             self.recursive_folder_rename_var,
@@ -1624,8 +1704,17 @@ class App(tk.Tk):
             model=self.model_var.get(),
             api_key=self.api_key_var.get(),
             debug_callback=self._queue_debug_event,
-            timeout_seconds=clamp_ai_timeout_seconds(self.ai_timeout_seconds_var.get()),
+            timeout_seconds=clamp_ai_timeout_seconds(
+                self._safe_int_var_get(self.ai_timeout_seconds_var, DEFAULT_AI_TIMEOUT_SECONDS)
+            ),
         )
+
+    def _safe_int_var_get(self, variable: tk.IntVar, default: int) -> int:
+        """Safely read IntVar values while users are mid-edit in Spinbox fields."""
+        try:
+            return int(variable.get())
+        except (TypeError, ValueError, tk.TclError):
+            return default
 
     def _queue_debug_event(self, message: str) -> None:
         """Queue debug events from worker threads so UI updates stay thread-safe."""
@@ -1633,6 +1722,8 @@ class App(tk.Tk):
 
     def _refresh_oauth_status_label(self) -> None:
         """Show whether a reusable OpenAI OAuth token is available in app settings."""
+        if not self.oauth_status_label or not self.oauth_status_label.winfo_exists():
+            return
         token = self.api_key_var.get().strip()
         if token:
             prefix = token[:8]
@@ -1654,8 +1745,34 @@ class App(tk.Tk):
             self.status_var.set("Switch to Remote mode to connect OpenAI OAuth.")
             return
 
+        # Keep connect behavior true OAuth-only: no token copy/paste should ever be needed.
+        # If Client ID is missing we fail fast with guidance, rather than sending users to
+        # unrelated pages that feel like a non-OAuth login flow.
+        if not self.openai_client_id_var.get().strip():
+            messagebox.showerror(
+                "OpenAI OAuth Client ID missing",
+                "OpenAI browser OAuth requires a configured Client ID.\n\n"
+                "Set OPENAI_OAUTH_CLIENT_ID (recommended) or enter a Client ID in AI Provider settings, "
+                "then click Connect OpenAI again.\n\n"
+                "After that, sign-in happens in-browser and returns to this app automatically—"
+                "no manual token copy/paste is needed.",
+            )
+            self.status_var.set("OpenAI OAuth Client ID is missing. Configure it, then retry Connect OpenAI.")
+            return
+
+        # Preflight validation catches common config mismatch before opening browser.
+        auth_host = urllib.parse.urlparse(self.openai_auth_url_var.get().strip()).hostname or ""
+        token_host = urllib.parse.urlparse(self.openai_token_url_var.get().strip()).hostname or ""
+        if auth_host != "auth.openai.com" or token_host != "auth.openai.com":
+            messagebox.showwarning(
+                "OAuth endpoint mismatch",
+                "OpenAI OAuth endpoints should normally use auth.openai.com.\n\n"
+                "If you changed auth/token URLs intentionally for a compatible provider, ignore this warning.",
+            )
+
         self.oauth_in_progress = True
-        self.oauth_connect_button.configure(state="disabled")
+        if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
+            self.oauth_connect_button.configure(state="disabled")
         self.status_var.set("Opening browser for OpenAI OAuth login…")
         worker = threading.Thread(target=self._openai_oauth_login_worker, daemon=True)
         worker.start()
@@ -1668,6 +1785,8 @@ class App(tk.Tk):
                 auth_url=self.openai_auth_url_var.get(),
                 token_url=self.openai_token_url_var.get(),
                 scope=self.openai_scope_var.get(),
+                audience=self.openai_audience_var.get(),
+                redirect_uri=self.openai_redirect_uri_var.get(),
             )
             token_payload = oauth_client.authorize()
             access_token = str(token_payload.get("access_token", "")).strip()
@@ -1732,6 +1851,185 @@ class App(tk.Tk):
             self.debug_text.insert(tk.END, message)
             self.debug_text.see(tk.END)
 
+    def _attach_tooltip(self, widget: tk.Widget, text: str) -> None:
+        """Attach a lightweight tooltip so settings controls remain self-explanatory."""
+        tooltip_window: Optional[tk.Toplevel] = None
+
+        def show_tooltip(_: tk.Event) -> None:
+            nonlocal tooltip_window
+            if tooltip_window and tooltip_window.winfo_exists():
+                return
+            x = widget.winfo_rootx() + 14
+            y = widget.winfo_rooty() + widget.winfo_height() + 8
+            tooltip_window = tk.Toplevel(widget)
+            tooltip_window.wm_overrideredirect(True)
+            tooltip_window.wm_geometry(f"+{x}+{y}")
+            ttk.Label(
+                tooltip_window,
+                text=text,
+                background="#fffbe6",
+                foreground="#333",
+                relief="solid",
+                borderwidth=1,
+                padding=(8, 4),
+            ).pack()
+
+        def hide_tooltip(_: tk.Event) -> None:
+            nonlocal tooltip_window
+            if tooltip_window and tooltip_window.winfo_exists():
+                tooltip_window.destroy()
+            tooltip_window = None
+
+        widget.bind("<Enter>", show_tooltip)
+        widget.bind("<Leave>", hide_tooltip)
+
+    def _open_ai_provider_settings(self) -> None:
+        """Open AI-provider-specific settings in a dedicated popup dialog."""
+        window = tk.Toplevel(self)
+        window.title("AI Provider Settings")
+        window.geometry("760x390")
+        window.minsize(700, 340)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Mode").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
+        mode_combo = ttk.Combobox(
+            frame,
+            textvariable=self.provider_mode_var,
+            values=["Local (Ollama /api/generate)", "Remote (OpenAI-compatible /v1/chat/completions)"],
+            state="readonly",
+        )
+        mode_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        mode_combo.bind("<<ComboboxSelected>>", lambda _: self._handle_mode_change())
+
+        ttk.Label(frame, text="Endpoint").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Entry(frame, textvariable=self.endpoint_var).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+
+        ttk.Label(frame, text="Model").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
+        model_row = ttk.Frame(frame)
+        model_row.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        model_row.columnconfigure(0, weight=1)
+        self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var)
+        self.model_combo.grid(row=0, column=0, sticky="ew")
+        fetch_models_button = ttk.Button(model_row, text="↻ Fetch Ollama Models", command=self._start_ollama_model_refresh)
+        fetch_models_button.grid(row=0, column=1, padx=(6, 0))
+        self._attach_tooltip(fetch_models_button, "Refresh local Ollama models from the configured endpoint.")
+
+        ttk.Label(frame, text="OpenAI OAuth Client ID").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Entry(frame, textvariable=self.openai_client_id_var).grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        ttk.Label(frame, text="OpenAI OAuth Audience").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        audience_entry = ttk.Entry(frame, textvariable=self.openai_audience_var)
+        audience_entry.grid(row=4, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self._attach_tooltip(audience_entry, "Usually api.openai.com. Leave default unless OpenAI support says otherwise.")
+        ttk.Label(frame, text="OpenAI Redirect URI").grid(row=5, column=0, sticky="w", padx=8, pady=(8, 0))
+        redirect_entry = ttk.Entry(frame, textvariable=self.openai_redirect_uri_var)
+        redirect_entry.grid(row=5, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self._attach_tooltip(
+            redirect_entry,
+            "Must match your OpenAI app exactly (e.g. http://127.0.0.1:8765/oauth/callback).",
+        )
+        ttk.Label(
+            frame,
+            text="Tip: Set OPENAI_OAUTH_CLIENT_ID env var to prefill this automatically.",
+            foreground="#666",
+        ).grid(row=6, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
+
+        oauth_controls = ttk.Frame(frame)
+        oauth_controls.grid(row=7, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        self.oauth_connect_button = ttk.Button(oauth_controls, text="🔐 Connect OpenAI", command=self._start_openai_oauth_login)
+        self.oauth_connect_button.pack(side=tk.LEFT)
+        self.oauth_disconnect_button = ttk.Button(oauth_controls, text="🧹 Forget Token", command=self._clear_openai_token)
+        self.oauth_disconnect_button.pack(side=tk.LEFT, padx=(6, 0))
+        oauth_setup_button = ttk.Button(
+            oauth_controls,
+            text="ℹ️ OAuth Setup Help",
+            command=lambda: webbrowser.open(OPENAI_OAUTH_APP_SETUP_URL, new=1),
+        )
+        oauth_setup_button.pack(side=tk.LEFT, padx=(6, 0))
+        self._attach_tooltip(oauth_setup_button, "Open OpenAI docs/settings to create or find your OAuth Client ID.")
+
+        ttk.Label(frame, text="Token Status").grid(row=7, column=0, sticky="w", padx=8, pady=(8, 0))
+        self.oauth_status_label = ttk.Label(frame, text="Not connected", foreground="#666")
+        self.oauth_status_label.grid(row=8, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
+
+        ttk.Label(frame, text="⏱️ AI timeout (sec)").grid(row=9, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Spinbox(frame, from_=30, to=3600, increment=30, textvariable=self.ai_timeout_seconds_var, width=10).grid(
+            row=9, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        ttk.Label(
+            frame,
+            text="Tip: Connect OpenAI launches browser OAuth and returns here automatically (no token copy/paste).",
+            foreground="#666",
+        ).grid(row=10, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
+
+        self._handle_mode_change()
+        self._refresh_oauth_status_label()
+
+    def _open_naming_rules_settings(self) -> None:
+        """Open filename and folder naming preferences in a focused popup dialog."""
+        window = tk.Toplevel(self)
+        window.title("Naming Rules")
+        window.geometry("760x360")
+        window.minsize(700, 320)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Checkbutton(frame, text="📅 Include date prefix", variable=self.include_date_var).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(8, 0)
+        )
+        ttk.Label(frame, text="Format").grid(row=0, column=1, sticky="e", padx=(0, 4), pady=(8, 0))
+        ttk.Entry(frame, width=14, textvariable=self.date_format_var).grid(row=0, column=2, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(frame, text="(strftime e.g. %Y-%m-%d)", foreground="#666").grid(
+            row=0, column=3, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+
+        ttk.Label(frame, text="Separator").grid(row=1, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Combobox(
+            frame,
+            width=18,
+            textvariable=self.word_separator_var,
+            state="readonly",
+            values=["Underscores (_)", "White spaces ( )"],
+        ).grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(frame, text="Case").grid(row=1, column=2, sticky="e", padx=(0, 4), pady=(8, 0))
+        ttk.Combobox(
+            frame,
+            width=12,
+            textvariable=self.capitalization_var,
+            state="readonly",
+            values=["lowercase", "Title Case", "Natural language"],
+        ).grid(row=1, column=3, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(
+            frame,
+            text="Natural language keeps AI sentence-style wording (incl. apostrophes).",
+            foreground="#666",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 0))
+
+        ttk.Label(frame, text="Max filename length").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Spinbox(frame, from_=16, to=MAX_WINDOWS_FILENAME_LENGTH, width=6, textvariable=self.max_filename_length_var).grid(
+            row=3, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        ttk.Label(frame, text="Includes date + extension", foreground="#666").grid(
+            row=3, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+
+        ttk.Label(frame, text="Max folder name length").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Spinbox(frame, from_=8, to=MAX_WINDOWS_FILENAME_LENGTH, width=6, textvariable=self.max_folder_name_length_var).grid(
+            row=4, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+
+        ttk.Checkbutton(frame, text="#️⃣ Include hashtags", variable=self.include_hashtags_var).grid(
+            row=5, column=0, sticky="w", padx=8, pady=(8, 8)
+        )
+        ttk.Label(frame, text="Count").grid(row=5, column=1, sticky="e", padx=(0, 4), pady=(8, 8))
+        ttk.Spinbox(frame, from_=1, to=10, width=4, textvariable=self.hashtag_count_var).grid(
+            row=5, column=2, sticky="w", padx=(0, 8), pady=(8, 8)
+        )
+        ttk.Label(frame, text="Hashtags stay inside your length limit.", foreground="#666").grid(
+            row=5, column=3, sticky="w", padx=(0, 8), pady=(8, 8)
+        )
+
     def _handle_mode_change(self) -> None:
         """Adjust defaults and OAuth controls based on selected provider mode."""
         self._capture_provider_fields_for_mode()
@@ -1740,17 +2038,23 @@ class App(tk.Tk):
             # Keep the user's local endpoint/model choices instead of resetting each toggle.
             self.endpoint_var.set(self.local_endpoint or DEFAULT_LOCAL_ENDPOINT)
             self.model_var.set(self.local_model or DEFAULT_LOCAL_MODEL)
-            self.model_combo.configure(state="normal")
-            self.oauth_connect_button.configure(state="disabled")
-            self.oauth_disconnect_button.configure(state="disabled")
+            if self.model_combo and self.model_combo.winfo_exists():
+                self.model_combo.configure(state="normal")
+            if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
+                self.oauth_connect_button.configure(state="disabled")
+            if self.oauth_disconnect_button and self.oauth_disconnect_button.winfo_exists():
+                self.oauth_disconnect_button.configure(state="disabled")
             self._start_ollama_model_refresh()
         else:
             # Keep the user's remote endpoint/model choices instead of resetting each toggle.
             self.endpoint_var.set(self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT)
             self.model_var.set(self.remote_model or DEFAULT_REMOTE_MODEL)
-            self.model_combo.configure(state="normal")
-            self.oauth_connect_button.configure(state="normal" if not self.oauth_in_progress else "disabled")
-            self.oauth_disconnect_button.configure(state="normal")
+            if self.model_combo and self.model_combo.winfo_exists():
+                self.model_combo.configure(state="normal")
+            if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
+                self.oauth_connect_button.configure(state="normal" if not self.oauth_in_progress else "disabled")
+            if self.oauth_disconnect_button and self.oauth_disconnect_button.winfo_exists():
+                self.oauth_disconnect_button.configure(state="normal")
 
         self._refresh_oauth_status_label()
 
@@ -1804,6 +2108,8 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.suggestions.clear()
         self.folder_structure_suggestions.clear()
+        self.row_open_paths.clear()
+        self.row_thumbnail_images.clear()
         self.status_var.set("Collecting files and requesting AI suggestions...")
 
         worker = threading.Thread(
@@ -1822,7 +2128,13 @@ class App(tk.Tk):
     def _current_preferences(self) -> FilenamePreferences:
         """Read and normalize naming preferences from the UI."""
         separator = " " if self.word_separator_var.get().startswith("White spaces") else "_"
-        capitalization = "title" if self.capitalization_var.get() == "Title Case" else "lower"
+        capitalization_choice = self.capitalization_var.get()
+        if capitalization_choice == "Title Case":
+            capitalization = "title"
+        elif capitalization_choice == "Natural language":
+            capitalization = "natural"
+        else:
+            capitalization = "lower"
         try:
             chosen_length = int(self.max_filename_length_var.get())
         except (TypeError, tk.TclError, ValueError):
@@ -1898,7 +2210,8 @@ class App(tk.Tk):
 
         self.folder_suggestions.clear()
         self.folder_structure_suggestions.clear()
-        self.folder_row_paths.clear()
+        self.row_open_paths.clear()
+        self.row_thumbnail_images.clear()
         # Clear and repurpose the output grid so users can review folder names before applying.
         self.tree.delete(*self.tree.get_children())
         self.status_var.set("Analyzing folders and generating AI folder names...")
@@ -1988,7 +2301,8 @@ class App(tk.Tk):
             return
 
         self.folder_structure_suggestions.clear()
-        self.folder_row_paths.clear()
+        self.row_open_paths.clear()
+        self.row_thumbnail_images.clear()
         self.tree.delete(*self.tree.get_children())
         self.status_var.set("Analyzing the full folder tree and building an AI restructure plan...")
 
@@ -2008,19 +2322,42 @@ class App(tk.Tk):
 
         provider = self._build_provider()
         try:
+            # Large local-model prompts can return empty `response` when context gets too big.
+            # Retry with progressively smaller inventories to keep planning reliable on big trees.
+            inventory_variants = [(240, 420), (140, 240), (80, 120)]
+            plan: Dict[str, object] = {}
+            operation_rows: List[Dict[str, object]] = []
+            sanitized: List[FolderStructureSuggestion] = []
             inventory = build_folder_inventory(folder, recursive=recursive_folders)
-            plan = provider.suggest_restructure_plan(inventory=inventory, preferences=preferences)
-            raw_operations = plan.get("operations", []) if isinstance(plan, dict) else []
-            operation_rows = raw_operations if isinstance(raw_operations, list) else []
-            sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
-            if operation_rows and not sanitized:
-                self.ui_queue.put(
-                    (
-                        "status",
-                        "AI returned operations, but none were actionable after sanitization. "
-                        "Try rerunning with a different model or adjust naming settings.",
-                    )
+
+            for variant_index, (node_limit, file_limit) in enumerate(inventory_variants, start=1):
+                inventory = build_folder_inventory(
+                    folder,
+                    recursive=recursive_folders,
+                    max_nodes=node_limit,
+                    max_files=file_limit,
                 )
+                plan = provider.suggest_restructure_plan(inventory=inventory, preferences=preferences)
+                raw_operations = plan.get("operations", []) if isinstance(plan, dict) else []
+                operation_rows = raw_operations if isinstance(raw_operations, list) else []
+                sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
+                if operation_rows:
+                    if not sanitized:
+                        self.ui_queue.put(
+                            (
+                                "status",
+                                "AI returned operations, but none were actionable after sanitization. "
+                                "Try rerunning with a different model or adjust naming settings.",
+                            )
+                        )
+                    break
+                if variant_index < len(inventory_variants):
+                    self.ui_queue.put(
+                        (
+                            "status",
+                            "AI returned no operations; retrying with a more compact tree summary...",
+                        )
+                    )
 
             missing_sources = find_missing_restructure_sources(
                 suggestions=sanitized,
@@ -2244,19 +2581,19 @@ class App(tk.Tk):
         )
 
     def _show_row_context_menu(self, event: tk.Event) -> None:
-        """Show context menu on folder suggestion rows for quick OS folder access."""
+        """Show context menu on suggestion rows for quick OS folder access."""
         row_id = self.tree.identify_row(event.y)
-        if not row_id or row_id not in self.folder_row_paths:
+        if not row_id or row_id not in self.row_open_paths:
             return
         self.tree.selection_set(row_id)
         self.folder_menu.tk_popup(event.x_root, event.y_root)
 
     def _open_selected_folder_in_explorer(self) -> None:
-        """Open the currently selected folder suggestion in the OS file explorer."""
+        """Open the currently selected row's folder in the OS file explorer."""
         selected = self.tree.selection()
         if not selected:
             return
-        folder_path = self.folder_row_paths.get(selected[0])
+        folder_path = self.row_open_paths.get(selected[0])
         if not folder_path or not folder_path.exists():
             messagebox.showwarning("Folder missing", "The selected folder no longer exists.")
             return
@@ -2271,6 +2608,31 @@ class App(tk.Tk):
             self.status_var.set(f"Opened folder: {folder_path}")
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Open folder failed", f"Could not open folder: {exc}")
+
+    def _build_row_thumbnail(self, path: Path, size: Tuple[int, int] = (44, 44)) -> Optional[tk.PhotoImage]:
+        """Build a small preview image for image/video rows in the results table."""
+        try:
+            from PIL import Image, ImageTk
+            from io import BytesIO
+
+            if path.suffix.lower() in IMAGE_EXTENSIONS:
+                with Image.open(path) as image:
+                    preview = image.convert("RGB")
+                    preview.thumbnail(size)
+                    return ImageTk.PhotoImage(preview)
+
+            if path.suffix.lower() in VIDEO_EXTENSIONS:
+                # Reuse existing first-frame extraction for consistent lightweight video previews.
+                first_frame_jpeg = extract_video_first_frame(path)
+                with Image.open(BytesIO(first_frame_jpeg)) as image:
+                    preview = image.convert("RGB")
+                    preview.thumbnail(size)
+                    return ImageTk.PhotoImage(preview)
+
+            return None
+        except Exception:
+            # Thumbnail generation is best-effort only; skip previews on decode errors.
+            return None
 
     def _remove_empty_folders(self) -> None:
         """Remove empty folders inside the selected path after confirmation."""
@@ -2287,6 +2649,19 @@ class App(tk.Tk):
         removed = remove_empty_folders(folder, recursive=True)
         self.status_var.set(f"Empty-folder cleanup complete: removed {removed} folder(s).")
 
+    def _insert_result_row(self, values: Tuple[str, str, str, str], image: Optional[tk.PhotoImage] = None) -> str:
+        """Insert one table row safely and set columns individually.
+
+        Setting column values via `tree.set` avoids Tcl argument edge-cases when AI text
+        includes characters that can confuse direct variadic option formatting.
+        """
+        row_id = self.tree.insert("", tk.END, text="", image=image or "")
+        self.tree.set(row_id, "original", values[0])
+        self.tree.set(row_id, "suggestion", values[1])
+        self.tree.set(row_id, "final", values[2])
+        self.tree.set(row_id, "status", values[3])
+        return row_id
+
     def _process_ui_queue(self) -> None:
         while True:
             try:
@@ -2298,20 +2673,26 @@ class App(tk.Tk):
             if kind == "add":
                 rec: FileSuggestion = msg[1]
                 self.suggestions.append(rec)
-                self.tree.insert("", tk.END, values=(rec.original_name, rec.suggested_name, rec.final_name, "Ready"))
+                row_thumbnail = self._build_row_thumbnail(rec.path)
+                row_id = self._insert_result_row(
+                    values=(rec.original_name, rec.suggested_name, rec.final_name, "Ready"),
+                    image=row_thumbnail,
+                )
+                # File rows should open their containing folder from the context menu.
+                self.row_open_paths[row_id] = rec.path.parent
+                if row_thumbnail is not None:
+                    self.row_thumbnail_images[row_id] = row_thumbnail
             elif kind == "error_row":
                 original_name, error_text = msg[1], msg[2]
-                self.tree.insert("", tk.END, values=(original_name, "", "", f"Error: {error_text}"))
+                self._insert_result_row(values=(original_name, "", "", f"Error: {error_text}"))
             elif kind == "folder_add":
                 folder_rec: FolderSuggestion = msg[1]
                 # Reuse the same output table so folder rename previews are visible before apply.
-                row_id = self.tree.insert(
-                    "",
-                    tk.END,
+                row_id = self._insert_result_row(
                     values=(folder_rec.original_name, folder_rec.suggested_name, folder_rec.suggested_name, "Folder Ready"),
                 )
                 # Keep exact paths for right-click Explorer actions.
-                self.folder_row_paths[row_id] = folder_rec.path
+                self.row_open_paths[row_id] = folder_rec.path
             elif kind == "restructure_add":
                 move_rec: FolderStructureSuggestion = msg[1]
                 # Show both old and new structure paths for clearer pre-apply review.
@@ -2319,18 +2700,20 @@ class App(tk.Tk):
                     move_rec.original_relative,
                     move_rec.target_relative,
                 )
-                row_id = self.tree.insert(
-                    "",
-                    tk.END,
+                row_id = self._insert_result_row(
                     values=(old_path, new_path, transition, f"{move_rec.item_type.title()} Move"),
                 )
-                self.folder_row_paths[row_id] = move_rec.source_path
+                # File move previews should open the parent folder; folder previews open that folder directly.
+                self.row_open_paths[row_id] = (
+                    move_rec.source_path.parent if move_rec.item_type == "file" else move_rec.source_path
+                )
             elif kind == "status":
                 self.status_var.set(msg[1])
             elif kind == "ollama_models":
                 models: List[str] = msg[1]
                 self.ollama_models = models
-                self.model_combo.configure(values=models)
+                if self.model_combo and self.model_combo.winfo_exists():
+                    self.model_combo.configure(values=models)
                 # Keep the current model if valid; otherwise default to the first discovered model.
                 if models and self.model_var.get() not in models:
                     self.model_var.set(models[0])
@@ -2342,7 +2725,18 @@ class App(tk.Tk):
                 self._refresh_oauth_status_label()
                 self.status_var.set("OpenAI OAuth connected. Token saved for future runs.")
             elif kind == "oauth_error":
-                self.status_var.set(f"OpenAI OAuth failed: {msg[1]}")
+                error_text = str(msg[1])
+                if "unknown_error" in error_text:
+                    error_text = (
+                        f"{error_text}\n\n"
+                        "OpenAI returned an unknown_error before callback. Double-check:\n"
+                        "• Client ID starts with app_ and is active\n"
+                        "• Redirect URI in this app exactly matches OpenAI app settings\n"
+                        "• OAuth Audience (if required) matches your OpenAI app configuration\n"
+                        "• Auth/Token URLs are auth.openai.com"
+                    )
+                self.status_var.set(f"OpenAI OAuth failed: {error_text}")
+                messagebox.showerror("OpenAI OAuth failed", error_text)
             elif kind == "oauth_done":
                 self.oauth_in_progress = False
                 self._handle_mode_change()
