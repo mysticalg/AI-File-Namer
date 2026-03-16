@@ -960,6 +960,75 @@ def fetch_ollama_model_names(generate_endpoint: str, timeout_seconds: int = 8) -
     return parse_ollama_model_names(payload)
 
 
+def build_openai_models_endpoint(chat_completions_endpoint: str) -> str:
+    """Convert a chat-completions endpoint into `/v1/models` for model discovery."""
+    endpoint = (chat_completions_endpoint or DEFAULT_REMOTE_ENDPOINT).strip()
+    parsed = urllib.parse.urlparse(endpoint)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+
+    if "/v1/" in parsed.path:
+        base_path = parsed.path.split("/v1/", 1)[0]
+        model_path = f"{base_path}/v1/models"
+    else:
+        model_path = f"{parsed.path.rstrip('/')}/v1/models"
+
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, model_path, "", "", ""))
+
+
+def parse_openai_model_names(payload: Dict[str, object]) -> List[str]:
+    """Extract sorted model IDs from OpenAI `/v1/models` payload."""
+    raw_models = payload.get("data", [])
+    if not isinstance(raw_models, list):
+        return []
+
+    ignored_prefixes = (
+        "whisper-",
+        "tts-",
+        "dall-e-",
+        "omni-moderation",
+        "text-embedding-",
+        "gpt-image-",
+    )
+    discovered: List[str] = []
+    for item in raw_models:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not isinstance(model_id, str):
+            continue
+        cleaned = model_id.strip()
+        if not cleaned:
+            continue
+        if cleaned.startswith(ignored_prefixes):
+            continue
+        discovered.append(cleaned)
+    return sorted(set(discovered), key=str.lower)
+
+
+def fetch_openai_model_names(chat_completions_endpoint: str, api_key: str, timeout_seconds: int = 8) -> List[str]:
+    """Fetch remote OpenAI model names for the model dropdown.
+
+    Uses only API-key auth to keep OAuth/app-id optional for standard remote setups.
+    """
+    import requests
+
+    models_endpoint = build_openai_models_endpoint(chat_completions_endpoint)
+    if not models_endpoint:
+        raise ValueError("OpenAI endpoint is invalid. Expected an https://.../v1/chat/completions style URL.")
+    token = api_key.strip()
+    if not token:
+        raise ValueError("OpenAI API key is required to fetch remote models.")
+
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(models_endpoint, headers=headers, timeout=timeout_seconds)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        return []
+    return parse_openai_model_names(payload)
+
+
 def build_ollama_missing_guidance(error_text: str) -> str:
     """Return actionable status guidance when local Ollama looks unavailable."""
     normalized = error_text.lower()
@@ -1488,6 +1557,7 @@ class App(tk.Tk):
         self.remote_endpoint = str(loaded_settings.get("remote_endpoint", DEFAULT_REMOTE_ENDPOINT))
         self.local_model = str(loaded_settings.get("local_model", DEFAULT_LOCAL_MODEL))
         self.remote_model = str(loaded_settings.get("remote_model", DEFAULT_REMOTE_MODEL))
+        self.remote_models: List[str] = []
 
         self.suggestions: List[FileSuggestion] = []
         self.folder_suggestions: List[FolderSuggestion] = []
@@ -1510,6 +1580,8 @@ class App(tk.Tk):
         self.oauth_in_progress = False
         # Dialog widget references are optional because settings now live in popup windows.
         self.model_combo: Optional[ttk.Combobox] = None
+        self.fetch_local_models_button: Optional[ttk.Button] = None
+        self.fetch_remote_models_button: Optional[ttk.Button] = None
         self.oauth_connect_button: Optional[ttk.Button] = None
         self.oauth_disconnect_button: Optional[ttk.Button] = None
         self.oauth_status_label: Optional[ttk.Label] = None
@@ -1816,10 +1888,19 @@ class App(tk.Tk):
 
     def _build_provider(self) -> AIProvider:
         """Construct provider from current UI values."""
+        mode = self.provider_mode_var.get()
+        endpoint = self.endpoint_var.get()
+        model = self.model_var.get()
+        if mode.startswith("Remote"):
+            # Keep remote calls pinned to OpenAI defaults unless user explicitly set another remote endpoint/model.
+            endpoint = endpoint.strip() or self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT
+            if endpoint == DEFAULT_LOCAL_ENDPOINT:
+                endpoint = DEFAULT_REMOTE_ENDPOINT
+            model = model.strip() or self.remote_model or DEFAULT_REMOTE_MODEL
         return AIProvider(
-            mode=self.provider_mode_var.get(),
-            endpoint=self.endpoint_var.get(),
-            model=self.model_var.get(),
+            mode=mode,
+            endpoint=endpoint,
+            model=model,
             api_key=self.api_key_var.get(),
             debug_callback=self._queue_debug_event,
             timeout_seconds=clamp_ai_timeout_seconds(
@@ -2030,9 +2111,23 @@ class App(tk.Tk):
         model_row.columnconfigure(0, weight=1)
         self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var)
         self.model_combo.grid(row=0, column=0, sticky="ew")
-        fetch_models_button = ttk.Button(model_row, text="↻ Fetch Ollama Models", command=self._start_ollama_model_refresh)
-        fetch_models_button.grid(row=0, column=1, padx=(6, 0))
-        self._attach_tooltip(fetch_models_button, "Refresh local Ollama models from the configured endpoint.")
+        self.fetch_local_models_button = ttk.Button(
+            model_row,
+            text="↻ Fetch Ollama Models",
+            command=self._start_ollama_model_refresh,
+        )
+        self.fetch_local_models_button.grid(row=0, column=1, padx=(6, 0))
+        self._attach_tooltip(self.fetch_local_models_button, "Refresh local Ollama models from the configured endpoint.")
+        self.fetch_remote_models_button = ttk.Button(
+            model_row,
+            text="☁️ Fetch OpenAI Models",
+            command=self._start_remote_model_refresh,
+        )
+        self.fetch_remote_models_button.grid(row=0, column=2, padx=(6, 0))
+        self._attach_tooltip(
+            self.fetch_remote_models_button,
+            "Fetch remote OpenAI models via /v1/models using your API key.",
+        )
 
         ttk.Label(frame, text="OpenAI API Key").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
         api_key_entry = ttk.Entry(frame, textvariable=self.api_key_var, show="•")
@@ -2058,7 +2153,7 @@ class App(tk.Tk):
         )
         ttk.Label(
             frame,
-            text="Tip: Set OPENAI_OAUTH_CLIENT_ID env var to prefill this automatically.",
+            text="OAuth is optional. API key + remote model is enough for OpenAI remote mode.",
             foreground="#666",
         ).grid(row=7, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
 
@@ -2166,7 +2261,11 @@ class App(tk.Tk):
             self.endpoint_var.set(self.local_endpoint or DEFAULT_LOCAL_ENDPOINT)
             self.model_var.set(self.local_model or DEFAULT_LOCAL_MODEL)
             if self.model_combo and self.model_combo.winfo_exists():
-                self.model_combo.configure(state="normal")
+                self.model_combo.configure(state="normal", values=self.ollama_models)
+            if self.fetch_local_models_button and self.fetch_local_models_button.winfo_exists():
+                self.fetch_local_models_button.configure(state="normal")
+            if self.fetch_remote_models_button and self.fetch_remote_models_button.winfo_exists():
+                self.fetch_remote_models_button.configure(state="disabled")
             if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
                 self.oauth_connect_button.configure(state="disabled")
             if self.oauth_disconnect_button and self.oauth_disconnect_button.winfo_exists():
@@ -2177,7 +2276,11 @@ class App(tk.Tk):
             self.endpoint_var.set(self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT)
             self.model_var.set(self.remote_model or DEFAULT_REMOTE_MODEL)
             if self.model_combo and self.model_combo.winfo_exists():
-                self.model_combo.configure(state="normal")
+                self.model_combo.configure(state="normal", values=self.remote_models)
+            if self.fetch_local_models_button and self.fetch_local_models_button.winfo_exists():
+                self.fetch_local_models_button.configure(state="disabled")
+            if self.fetch_remote_models_button and self.fetch_remote_models_button.winfo_exists():
+                self.fetch_remote_models_button.configure(state="normal")
             if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
                 self.oauth_connect_button.configure(state="normal" if not self.oauth_in_progress else "disabled")
             if self.oauth_disconnect_button and self.oauth_disconnect_button.winfo_exists():
@@ -2213,6 +2316,43 @@ class App(tk.Tk):
         else:
             self.ui_queue.put(("status", "No Ollama models found. Pull a model or type one manually."))
 
+    def _start_remote_model_refresh(self) -> None:
+        """Load available remote OpenAI models into the model dropdown without blocking the UI."""
+        if not self.provider_mode_var.get().startswith("Remote"):
+            return
+
+        # Ensure remote mode always targets OpenAI chat-completions when using API-key auth.
+        endpoint = self.endpoint_var.get().strip()
+        if not endpoint or endpoint == DEFAULT_LOCAL_ENDPOINT:
+            self.endpoint_var.set(self.remote_endpoint or DEFAULT_REMOTE_ENDPOINT)
+        token = self.api_key_var.get().strip()
+        if not token:
+            self.status_var.set("Add an OpenAI API key to fetch remote model options.")
+            return
+
+        self.ui_queue.put(("status", "Fetching available OpenAI remote models..."))
+        worker = threading.Thread(
+            target=self._remote_model_refresh_worker,
+            args=(self.endpoint_var.get(), token),
+            daemon=True,
+        )
+        worker.start()
+
+    def _remote_model_refresh_worker(self, endpoint: str, api_key: str) -> None:
+        """Fetch remote model list and publish UI update events."""
+        try:
+            models = fetch_openai_model_names(endpoint, api_key=api_key)
+        except Exception as exc:  # noqa: BLE001
+            self.ui_queue.put(("debug", format_debug_event("OpenAI model refresh failed", {"error": str(exc)})))
+            self.ui_queue.put(("status", f"Could not fetch OpenAI models: {exc}"))
+            return
+
+        self.ui_queue.put(("remote_models", models))
+        if models:
+            self.ui_queue.put(("status", f"Loaded {len(models)} OpenAI model(s) into the dropdown."))
+        else:
+            self.ui_queue.put(("status", "No OpenAI models found. You can still type one manually."))
+
     def _select_folder(self) -> None:
         selected = filedialog.askdirectory()
         if selected:
@@ -2227,7 +2367,7 @@ class App(tk.Tk):
         if self.provider_mode_var.get().startswith("Remote") and not self.api_key_var.get().strip():
             messagebox.showwarning(
                 "Remote credential required",
-                "Add an OpenAI API key or connect with OpenAI OAuth first. "
+                "Add an OpenAI API key first (OAuth is optional). "
                 "Remote usage requires an OpenAI account: "
                 f"{OPENAI_REGISTRATION_URL}",
             )
@@ -2859,11 +2999,20 @@ class App(tk.Tk):
             elif kind == "ollama_models":
                 models: List[str] = msg[1]
                 self.ollama_models = models
-                if self.model_combo and self.model_combo.winfo_exists():
+                if self.provider_mode_var.get().startswith("Local") and self.model_combo and self.model_combo.winfo_exists():
                     self.model_combo.configure(values=models)
                 # Keep the current model if valid; otherwise default to the first discovered model.
-                if models and self.model_var.get() not in models:
+                if models and self.provider_mode_var.get().startswith("Local") and self.model_var.get() not in models:
                     self.model_var.set(models[0])
+            elif kind == "remote_models":
+                models = msg[1]
+                self.remote_models = models
+                if self.provider_mode_var.get().startswith("Remote") and self.model_combo and self.model_combo.winfo_exists():
+                    self.model_combo.configure(values=models)
+                # Prefer the default remote model if present, else first fetched option.
+                if models and self.provider_mode_var.get().startswith("Remote") and self.model_var.get() not in models:
+                    preferred = DEFAULT_REMOTE_MODEL if DEFAULT_REMOTE_MODEL in models else models[0]
+                    self.model_var.set(preferred)
             elif kind == "debug":
                 self._append_debug_output(msg[1])
             elif kind == "oauth_connected":
