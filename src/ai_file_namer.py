@@ -923,7 +923,12 @@ def build_ollama_missing_guidance(error_text: str) -> str:
     return "Could not fetch Ollama models. You can still type a model manually."
 
 
-def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
+def build_folder_inventory(
+    folder: Path,
+    recursive: bool,
+    max_nodes: int = 240,
+    max_files: int = 420,
+) -> Dict[str, object]:
     """Build a compact folder+file representation for AI restructure planning.
 
     The payload intentionally avoids redundant per-row keys so AI requests stay
@@ -931,8 +936,6 @@ def build_folder_inventory(folder: Path, recursive: bool) -> Dict[str, object]:
     """
     folders = collect_subfolders(folder, recursive=recursive)
     files = sorted(path for path in folder.glob("**/*" if recursive else "*") if path.is_file())
-    max_nodes = 240
-    max_files = 420
     folder_paths = [str(path.relative_to(folder)).replace("\\", "/") for path in folders]
     sampled_paths = folder_paths[:max_nodes]
     file_paths = [str(path.relative_to(folder)).replace("\\", "/") for path in files]
@@ -2319,19 +2322,42 @@ class App(tk.Tk):
 
         provider = self._build_provider()
         try:
+            # Large local-model prompts can return empty `response` when context gets too big.
+            # Retry with progressively smaller inventories to keep planning reliable on big trees.
+            inventory_variants = [(240, 420), (140, 240), (80, 120)]
+            plan: Dict[str, object] = {}
+            operation_rows: List[Dict[str, object]] = []
+            sanitized: List[FolderStructureSuggestion] = []
             inventory = build_folder_inventory(folder, recursive=recursive_folders)
-            plan = provider.suggest_restructure_plan(inventory=inventory, preferences=preferences)
-            raw_operations = plan.get("operations", []) if isinstance(plan, dict) else []
-            operation_rows = raw_operations if isinstance(raw_operations, list) else []
-            sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
-            if operation_rows and not sanitized:
-                self.ui_queue.put(
-                    (
-                        "status",
-                        "AI returned operations, but none were actionable after sanitization. "
-                        "Try rerunning with a different model or adjust naming settings.",
-                    )
+
+            for variant_index, (node_limit, file_limit) in enumerate(inventory_variants, start=1):
+                inventory = build_folder_inventory(
+                    folder,
+                    recursive=recursive_folders,
+                    max_nodes=node_limit,
+                    max_files=file_limit,
                 )
+                plan = provider.suggest_restructure_plan(inventory=inventory, preferences=preferences)
+                raw_operations = plan.get("operations", []) if isinstance(plan, dict) else []
+                operation_rows = raw_operations if isinstance(raw_operations, list) else []
+                sanitized = sanitize_restructure_operations(operation_rows, root=folder, preferences=preferences)
+                if operation_rows:
+                    if not sanitized:
+                        self.ui_queue.put(
+                            (
+                                "status",
+                                "AI returned operations, but none were actionable after sanitization. "
+                                "Try rerunning with a different model or adjust naming settings.",
+                            )
+                        )
+                    break
+                if variant_index < len(inventory_variants):
+                    self.ui_queue.put(
+                        (
+                            "status",
+                            "AI returned no operations; retrying with a more compact tree summary...",
+                        )
+                    )
 
             missing_sources = find_missing_restructure_sources(
                 suggestions=sanitized,

@@ -446,6 +446,17 @@ class FilenameUtilsTests(unittest.TestCase):
             self.assertIn("photos", inventory["direct_children"])
             self.assertEqual(sorted(inventory["direct_children"]["photos"]), ["family", "travel"])
 
+    def test_build_folder_inventory_honors_sampling_limits(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            for idx in range(6):
+                (root / f"folder_{idx}").mkdir(parents=True)
+                (root / f"folder_{idx}" / f"file_{idx}.jpg").write_text("x")
+
+            inventory = build_folder_inventory(root, recursive=True, max_nodes=3, max_files=2)
+            self.assertLessEqual(len(inventory["folder_paths"]), 3)
+            self.assertLessEqual(len(inventory["file_paths"]), 2)
+
     def test_format_restructure_preview_paths_outputs_old_new_and_transition(self):
         old_path, new_path, transition = format_restructure_preview_paths(
             "Old Folder/Sub",
