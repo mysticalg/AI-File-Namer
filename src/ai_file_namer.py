@@ -1353,6 +1353,8 @@ class App(tk.Tk):
         # Per-row filesystem targets used by the right-click context menu.
         # For file suggestions we store the containing folder; for folder rows we store that folder.
         self.row_open_paths: Dict[str, Path] = {}
+        # Keep thumbnail image references alive for Treeview rows (Tkinter drops images if unreferenced).
+        self.row_thumbnail_images: Dict[str, tk.PhotoImage] = {}
         self.sort_state: Dict[str, bool] = {}
         self.debug_events: List[str] = []
         self.debug_window: Optional[tk.Toplevel] = None
@@ -1502,7 +1504,10 @@ class App(tk.Tk):
         table_wrapper.pack(fill=tk.BOTH, expand=True)
 
         cols = ("original", "suggestion", "final", "status")
-        self.tree = ttk.Treeview(table_wrapper, columns=cols, show="headings", selectmode="extended")
+        # Use the tree column (#0) to render image thumbnails while still keeping sortable headings.
+        self.tree = ttk.Treeview(table_wrapper, columns=cols, show="tree headings", selectmode="extended")
+        self.tree.heading("#0", text="Preview")
+        self.tree.column("#0", width=68, minwidth=56, anchor="center", stretch=False)
         # Clickable column headers for quick sorting while reviewing AI suggestions.
         self.tree.heading("original", text="Original", command=lambda: self._sort_tree_by_column("original"))
         self.tree.heading("suggestion", text="AI Suggestion", command=lambda: self._sort_tree_by_column("suggestion"))
@@ -2017,6 +2022,7 @@ class App(tk.Tk):
         self.suggestions.clear()
         self.folder_structure_suggestions.clear()
         self.row_open_paths.clear()
+        self.row_thumbnail_images.clear()
         self.status_var.set("Collecting files and requesting AI suggestions...")
 
         worker = threading.Thread(
@@ -2112,6 +2118,7 @@ class App(tk.Tk):
         self.folder_suggestions.clear()
         self.folder_structure_suggestions.clear()
         self.row_open_paths.clear()
+        self.row_thumbnail_images.clear()
         # Clear and repurpose the output grid so users can review folder names before applying.
         self.tree.delete(*self.tree.get_children())
         self.status_var.set("Analyzing folders and generating AI folder names...")
@@ -2202,6 +2209,7 @@ class App(tk.Tk):
 
         self.folder_structure_suggestions.clear()
         self.row_open_paths.clear()
+        self.row_thumbnail_images.clear()
         self.tree.delete(*self.tree.get_children())
         self.status_var.set("Analyzing the full folder tree and building an AI restructure plan...")
 
@@ -2485,6 +2493,21 @@ class App(tk.Tk):
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Open folder failed", f"Could not open folder: {exc}")
 
+    def _build_row_thumbnail(self, path: Path, size: Tuple[int, int] = (44, 44)) -> Optional[tk.PhotoImage]:
+        """Build a small preview image for image-file rows in the results table."""
+        if path.suffix.lower() not in IMAGE_EXTENSIONS:
+            return None
+        try:
+            from PIL import Image, ImageTk
+
+            with Image.open(path) as image:
+                preview = image.convert("RGB")
+                preview.thumbnail(size)
+                return ImageTk.PhotoImage(preview)
+        except Exception:
+            # Thumbnail generation is best-effort only; skip previews on decode errors.
+            return None
+
     def _remove_empty_folders(self) -> None:
         """Remove empty folders inside the selected path after confirmation."""
         folder = Path(self.folder_var.get()).expanduser()
@@ -2511,18 +2534,28 @@ class App(tk.Tk):
             if kind == "add":
                 rec: FileSuggestion = msg[1]
                 self.suggestions.append(rec)
-                row_id = self.tree.insert("", tk.END, values=(rec.original_name, rec.suggested_name, rec.final_name, "Ready"))
+                row_thumbnail = self._build_row_thumbnail(rec.path)
+                row_id = self.tree.insert(
+                    "",
+                    tk.END,
+                    text="",
+                    image=row_thumbnail,
+                    values=(rec.original_name, rec.suggested_name, rec.final_name, "Ready"),
+                )
                 # File rows should open their containing folder from the context menu.
                 self.row_open_paths[row_id] = rec.path.parent
+                if row_thumbnail is not None:
+                    self.row_thumbnail_images[row_id] = row_thumbnail
             elif kind == "error_row":
                 original_name, error_text = msg[1], msg[2]
-                self.tree.insert("", tk.END, values=(original_name, "", "", f"Error: {error_text}"))
+                self.tree.insert("", tk.END, text="", values=(original_name, "", "", f"Error: {error_text}"))
             elif kind == "folder_add":
                 folder_rec: FolderSuggestion = msg[1]
                 # Reuse the same output table so folder rename previews are visible before apply.
                 row_id = self.tree.insert(
                     "",
                     tk.END,
+                    text="",
                     values=(folder_rec.original_name, folder_rec.suggested_name, folder_rec.suggested_name, "Folder Ready"),
                 )
                 # Keep exact paths for right-click Explorer actions.
@@ -2537,6 +2570,7 @@ class App(tk.Tk):
                 row_id = self.tree.insert(
                     "",
                     tk.END,
+                    text="",
                     values=(old_path, new_path, transition, f"{move_rec.item_type.title()} Move"),
                 )
                 # File move previews should open the parent folder; folder previews open that folder directly.
