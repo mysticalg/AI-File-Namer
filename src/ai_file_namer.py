@@ -414,8 +414,7 @@ class AIProvider:
             response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
-            choices = response_json.get("choices", [])
-            content = choices[0]["message"]["content"] if choices else ""
+            content = extract_openai_text_content(response_json)
             self._emit_debug(
                 "AI response: suggest_name (remote)",
                 {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
@@ -495,8 +494,7 @@ class AIProvider:
             response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
-            choices = response_json.get("choices", [])
-            content = choices[0]["message"].get("content", "") if choices else ""
+            content = extract_openai_text_content(response_json)
             self._emit_debug(
                 "AI response: suggest_folder_name (remote)",
                 {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
@@ -570,8 +568,7 @@ class AIProvider:
             response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
-            choices = response_json.get("choices", [])
-            content = choices[0]["message"].get("content", "") if choices else ""
+            content = extract_openai_text_content(response_json)
             self._emit_debug(
                 "AI response: suggest_folder_structure (remote)",
                 {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
@@ -661,8 +658,7 @@ class AIProvider:
             response = requests.post(self.endpoint, headers=headers, json=payload, timeout=self.timeout_seconds)
             response.raise_for_status()
             response_json = response.json()
-            choices = response_json.get("choices", [])
-            content = choices[0]["message"].get("content", "") if choices else ""
+            content = extract_openai_text_content(response_json)
             self._emit_debug(
                 "AI response: suggest_restructure_plan (remote)",
                 {"status_code": response.status_code, "response": summarize_debug_payload(response_json)},
@@ -733,6 +729,67 @@ def sanitize_relative_destination_path(raw: str, preferences: FilenamePreference
         max_depth=max_depth,
     )
     return cleaned.strip("/")
+
+
+def _coerce_text_value(value: object) -> str:
+    """Flatten provider response fragments into plain text.
+
+    OpenAI-compatible endpoints are inconsistent across models/providers. This
+    helper accepts common text-bearing shapes and normalizes them into a single
+    string so downstream sanitization logic stays deterministic.
+    """
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, dict):
+        for key in ("text", "content", "output_text", "response"):
+            nested = value.get(key)
+            if nested is None:
+                continue
+            text = _coerce_text_value(nested)
+            if text:
+                return text
+        return ""
+
+    if isinstance(value, list):
+        parts: List[str] = []
+        for item in value:
+            text = _coerce_text_value(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+
+    return ""
+
+
+def extract_openai_text_content(payload: Dict[str, object]) -> str:
+    """Extract assistant text from diverse OpenAI-compatible response envelopes."""
+    choices = payload.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                text = _coerce_text_value(message.get("content"))
+                if text:
+                    return text
+            text = _coerce_text_value(choice.get("text"))
+            if text:
+                return text
+
+    output = payload.get("output")
+    if isinstance(output, list):
+        text = _coerce_text_value(output)
+        if text:
+            return text
+
+    for key in ("output_text", "response", "text", "content"):
+        text = _coerce_text_value(payload.get(key))
+        if text:
+            return text
+
+    return ""
 
 
 def extract_json_object(raw: str) -> Dict[str, object]:
@@ -986,13 +1043,59 @@ def format_restructure_preview_paths(original_relative: str, target_relative: st
     return old_path, new_path, transition
 
 
-def normalize_ai_source_relative_path(source_raw: str, root: Path) -> str:
-    """Convert AI `source` values into safe paths relative to the selected root.
+def _split_path_parts(raw_path: str) -> List[str]:
+    """Split raw paths into normalized path segments without drive/empty tokens."""
+    normalized = raw_path.strip().replace("\\", "/")
+    if normalized.startswith("file://"):
+        normalized = normalized[7:]
 
-    Some models return absolute-style paths (for example `/Bach/...`) or include
-    the selected root name. We normalize those to plain relative paths.
+    # Drop Windows drive designators (`D:`) so absolute Windows paths can be
+    # matched against root-relative folder names safely.
+    normalized = re.sub(r"^[A-Za-z]:/+", "", normalized)
+    parts = [part for part in normalized.split("/") if part and part not in {".", ".."}]
+    return parts
+
+
+def _looks_absolute_path(raw_path: str) -> bool:
+    """Return True when model output looks like an absolute/anchored path."""
+    candidate = raw_path.strip().replace("\\", "/")
+    return bool(
+        candidate.startswith("/")
+        or candidate.startswith("file://")
+        or re.match(r"^[A-Za-z]:/", candidate)
+    )
+
+
+def _strip_root_prefix_from_ai_path(raw_path: str, root: Path) -> str:
+    """Map AI path strings to safe paths relative to the selected root.
+
+    The model occasionally returns full absolute paths (for example
+    `D:/OneDrive/.../Bach/Works`) instead of root-relative paths. This helper
+    strips filesystem prefixes by aligning to the selected root path/name.
     """
-    cleaned = source_raw.strip().replace("\\", "/").strip("/")
+    raw_parts = _split_path_parts(raw_path)
+    if not raw_parts:
+        return ""
+
+    root_parts = _split_path_parts(str(root.resolve()))
+    if root_parts and raw_parts[: len(root_parts)] == root_parts:
+        return "/".join(raw_parts[len(root_parts) :]).strip("/")
+
+    root_name = root.name.strip().casefold()
+    for idx, part in enumerate(raw_parts):
+        if part.casefold() == root_name:
+            return "/".join(raw_parts[idx + 1 :]).strip("/")
+
+    # Keep relative model outputs even when they don't include root name, but
+    # discard unmatched absolute paths to prevent `D/...` folder creation.
+    if _looks_absolute_path(raw_path):
+        return ""
+    return "/".join(raw_parts).strip("/")
+
+
+def normalize_ai_source_relative_path(source_raw: str, root: Path) -> str:
+    """Convert AI `source` values into safe paths relative to the selected root."""
+    cleaned = _strip_root_prefix_from_ai_path(source_raw, root)
     if not cleaned:
         return ""
 
@@ -1006,7 +1109,7 @@ def normalize_ai_source_relative_path(source_raw: str, root: Path) -> str:
 
 def normalize_ai_destination_relative_path(destination_raw: str, root: Path, preferences: FilenamePreferences) -> str:
     """Convert AI `destination` parent values into safe root-relative paths."""
-    cleaned = destination_raw.strip().replace("\\", "/").strip("/")
+    cleaned = _strip_root_prefix_from_ai_path(destination_raw, root)
     if not cleaned or cleaned == root.name:
         return ""
     if cleaned.startswith(f"{root.name}/"):
