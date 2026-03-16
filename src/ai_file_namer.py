@@ -1370,6 +1370,9 @@ class App(tk.Tk):
         self.dedupe_keep_var = tk.StringVar(value=str(loaded_settings.get("dedupe_keep", "Keep first match")))
         self.ai_timeout_seconds_var = tk.IntVar(value=clamp_ai_timeout_seconds(loaded_settings.get("ai_timeout_seconds", DEFAULT_AI_TIMEOUT_SECONDS)))
         self.status_var = tk.StringVar(value="Choose a folder and generate AI suggestions.")
+        # Compact card summaries keep active configuration visible on the main window.
+        self.provider_card_summary_var = tk.StringVar(value="")
+        self.naming_card_summary_var = tk.StringVar(value="")
 
         # Store per-provider endpoint/model preferences so mode switches don't erase user values.
         self.local_endpoint = str(loaded_settings.get("local_endpoint", DEFAULT_LOCAL_ENDPOINT))
@@ -1454,24 +1457,36 @@ class App(tk.Tk):
         provider_card.columnconfigure(0, weight=1)
         ttk.Label(
             provider_card,
-            text="Provider setup moved to Settings ▾ for a cleaner main workflow.",
+            text="Current provider in use:",
             foreground="#666",
         ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
-        ttk.Button(provider_card, text="🧠 Open AI Provider Settings", command=self._open_ai_provider_settings).grid(
-            row=1, column=0, sticky="w", padx=8, pady=(0, 8)
-        )
+        ttk.Label(
+            provider_card,
+            textvariable=self.provider_card_summary_var,
+        ).grid(row=1, column=0, sticky="w", padx=8, pady=(0, 4))
+        ttk.Label(
+            provider_card,
+            text="Open ⚙️ Settings ▾ → 🧠 AI Provider to change mode/model.",
+            foreground="#666",
+        ).grid(row=2, column=0, sticky="w", padx=8, pady=(0, 8))
 
         naming_card = ttk.LabelFrame(top, text="✍️ Naming Rules")
         naming_card.grid(row=1, column=1, sticky="nsew", pady=(10, 0), padx=(6, 0))
         naming_card.columnconfigure(0, weight=1)
         ttk.Label(
             naming_card,
-            text="Naming conventions now live under Settings ▾.",
+            text="Current naming style:",
             foreground="#666",
         ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
-        ttk.Button(naming_card, text="✍️ Open Naming Rules", command=self._open_naming_rules_settings).grid(
-            row=1, column=0, sticky="w", padx=8, pady=(0, 8)
-        )
+        ttk.Label(
+            naming_card,
+            textvariable=self.naming_card_summary_var,
+        ).grid(row=1, column=0, sticky="w", padx=8, pady=(0, 4))
+        ttk.Label(
+            naming_card,
+            text="Open ⚙️ Settings ▾ → ✍️ Naming Rules to adjust casing/separators.",
+            foreground="#666",
+        ).grid(row=2, column=0, sticky="w", padx=8, pady=(0, 8))
 
         # 4) Folder operations section: renaming, restructure, dedupe and cleanup.
         folder_ops_frame = ttk.LabelFrame(top, text="🗂️ Folder Operations")
@@ -1576,6 +1591,7 @@ class App(tk.Tk):
         ttk.Label(self, textvariable=self.status_var, padding=(12, 0, 12, 12), foreground="#005a9c").pack(anchor="w")
 
         self._handle_mode_change()
+        self._refresh_settings_card_summaries()
         self._refresh_oauth_status_label()
 
     def _capture_provider_fields_for_mode(self) -> None:
@@ -1629,6 +1645,17 @@ class App(tk.Tk):
         if not self._settings_ready:
             return
         save_app_settings(self._settings_snapshot(), self.settings_path)
+        self._refresh_settings_card_summaries()
+
+    def _refresh_settings_card_summaries(self) -> None:
+        """Refresh compact provider/naming summary text shown on the main window cards."""
+        mode_text = "Local" if self.provider_mode_var.get().startswith("Local") else "Remote"
+        active_model = self.model_var.get().strip() or (DEFAULT_LOCAL_MODEL if mode_text == "Local" else DEFAULT_REMOTE_MODEL)
+        self.provider_card_summary_var.set(f"{mode_text} mode • model: {active_model}")
+
+        separator_text = "spaces" if self.word_separator_var.get().startswith("White spaces") else "underscores"
+        case_text = self.capitalization_var.get()
+        self.naming_card_summary_var.set(f"{case_text} • {separator_text}")
 
     def _register_settings_traces(self) -> None:
         """Attach variable traces so every control change is automatically persisted."""
