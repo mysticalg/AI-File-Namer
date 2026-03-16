@@ -85,6 +85,16 @@ class FilenameUtilsTests(unittest.TestCase):
         self.assertEqual(value, "A Very Descriptive Filename For A Coasta")
         self.assertLessEqual(len(value), 40)
 
+    def test_sanitize_filename_stem_supports_natural_language_case(self):
+        raw = "A visual representation of United States against United Kingdom's empire"
+        value = sanitize_filename_stem(raw, separator=" ", capitalization="natural", max_length=120)
+        self.assertEqual(value, "A visual representation of United States against United Kingdom's empire")
+
+    def test_sanitize_filename_stem_supports_natural_language_with_underscores(self):
+        raw = "United Kingdom's map overview"
+        value = sanitize_filename_stem(raw, separator="_", capitalization="natural", max_length=120)
+        self.assertEqual(value, "United_Kingdom's_map_overview")
+
     def test_append_hashtags_respects_max_length(self):
         result = append_hashtags("My Song Name", separator=" ", hashtag_count=3, max_length=22)
         self.assertLessEqual(len(result), 22)

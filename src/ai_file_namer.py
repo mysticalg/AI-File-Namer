@@ -92,6 +92,15 @@ def clamp_ai_timeout_seconds(value: Any) -> int:
     return max(30, min(parsed, 3600))
 
 
+def describe_capitalization_mode(mode: str) -> str:
+    """Return human-readable wording for naming-style instructions sent to the model."""
+    if mode == "title":
+        return "Title Case words"
+    if mode == "natural":
+        return "natural sentence-style wording"
+    return "lowercase words"
+
+
 def _pkce_code_challenge(verifier: str) -> str:
     """Build an RFC-7636 PKCE code challenge from a verifier string."""
     digest = hashlib.sha256(verifier.encode("utf-8")).digest()
@@ -322,7 +331,7 @@ class AIProvider:
         import requests
 
         style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
-        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        case_description = describe_capitalization_mode(preferences.capitalization)
         hashtag_description = (
             f" Append up to {preferences.hashtag_count} short hashtags at the end."
             if preferences.include_hashtags and preferences.hashtag_count > 0
@@ -425,7 +434,7 @@ class AIProvider:
 
         listed_items = ", ".join(child_entries[:40]) if child_entries else "empty_folder"
         style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
-        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        case_description = describe_capitalization_mode(preferences.capitalization)
         prompt = (
             "Return only a concise folder name based on these entries. "
             f"Use {style_description} and {case_description}. "
@@ -499,7 +508,7 @@ class AIProvider:
 
         listed_items = ", ".join(child_entries[:40]) if child_entries else "empty_folder"
         style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
-        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        case_description = describe_capitalization_mode(preferences.capitalization)
         prompt = (
             "Return only a category path for organizing this folder. "
             "Use 1 to 3 path segments separated by '/'. "
@@ -576,7 +585,7 @@ class AIProvider:
         import requests
 
         style_description = "spaces between words" if preferences.separator == " " else "underscores between words"
-        case_description = "Title Case words" if preferences.capitalization == "title" else "lowercase words"
+        case_description = describe_capitalization_mode(preferences.capitalization)
         prompt = (
             "You are organizing a messy folder tree. "
             "Primary goal: consolidate and simplify the tree so it has fewer, clearer folders. "
@@ -1131,17 +1140,27 @@ def sanitize_filename_stem(
     The returned value honors user preferences for separators/capitalization and
     trims to the requested maximum character count.
     """
-    cleaned = raw.strip().lower()
-    cleaned = re.sub(r"[`'\"\n\r]", " ", cleaned)
-    cleaned = re.sub(r"[^a-z0-9_\-\s]", " ", cleaned)
-    cleaned = cleaned.replace("-", " ")
-    cleaned = re.sub(r"\s+", separator, cleaned)
-    cleaned = cleaned.strip(" _.")
-    cleaned = "".join(ch for ch in cleaned if ch not in INVALID_FILENAME_CHARS)
-    if capitalization == "title":
-        # Preserve chosen separator while capitalizing each token for readability.
-        tokens = [token.capitalize() for token in cleaned.split(separator) if token]
-        cleaned = separator.join(tokens)
+    if capitalization == "natural":
+        # Natural mode preserves model wording/case while still enforcing Windows safety.
+        cleaned = raw.strip().replace("\n", " ").replace("\r", " ")
+        cleaned = cleaned.replace("_", " ").replace("-", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" _.")
+        cleaned = "".join(ch for ch in cleaned if ch not in INVALID_FILENAME_CHARS and ch.isprintable())
+        if separator == "_":
+            cleaned = re.sub(r"\s+", "_", cleaned)
+        cleaned = cleaned.strip(" _.")
+    else:
+        cleaned = raw.strip().lower()
+        cleaned = re.sub(r"[`'\"\n\r]", " ", cleaned)
+        cleaned = re.sub(r"[^a-z0-9_\-\s]", " ", cleaned)
+        cleaned = cleaned.replace("-", " ")
+        cleaned = re.sub(r"\s+", separator, cleaned)
+        cleaned = cleaned.strip(" _.")
+        cleaned = "".join(ch for ch in cleaned if ch not in INVALID_FILENAME_CHARS)
+        if capitalization == "title":
+            # Preserve chosen separator while capitalizing each token for readability.
+            tokens = [token.capitalize() for token in cleaned.split(separator) if token]
+            cleaned = separator.join(tokens)
     return cleaned[:max(1, max_length)]
 
 
@@ -1916,31 +1935,36 @@ class App(tk.Tk):
             width=12,
             textvariable=self.capitalization_var,
             state="readonly",
-            values=["lowercase", "Title Case"],
+            values=["lowercase", "Title Case", "Natural language"],
         ).grid(row=1, column=3, sticky="w", padx=(0, 8), pady=(8, 0))
+        ttk.Label(
+            frame,
+            text="Natural language keeps AI sentence-style wording (incl. apostrophes).",
+            foreground="#666",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 0))
 
-        ttk.Label(frame, text="Max filename length").grid(row=2, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(frame, text="Max filename length").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Spinbox(frame, from_=16, to=MAX_WINDOWS_FILENAME_LENGTH, width=6, textvariable=self.max_filename_length_var).grid(
-            row=2, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
+            row=3, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
         )
         ttk.Label(frame, text="Includes date + extension", foreground="#666").grid(
-            row=2, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(8, 0)
+            row=3, column=2, columnspan=2, sticky="w", padx=(0, 8), pady=(8, 0)
         )
 
-        ttk.Label(frame, text="Max folder name length").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(frame, text="Max folder name length").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Spinbox(frame, from_=8, to=MAX_WINDOWS_FILENAME_LENGTH, width=6, textvariable=self.max_folder_name_length_var).grid(
-            row=3, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
+            row=4, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
         )
 
         ttk.Checkbutton(frame, text="#️⃣ Include hashtags", variable=self.include_hashtags_var).grid(
-            row=4, column=0, sticky="w", padx=8, pady=(8, 8)
+            row=5, column=0, sticky="w", padx=8, pady=(8, 8)
         )
-        ttk.Label(frame, text="Count").grid(row=4, column=1, sticky="e", padx=(0, 4), pady=(8, 8))
+        ttk.Label(frame, text="Count").grid(row=5, column=1, sticky="e", padx=(0, 4), pady=(8, 8))
         ttk.Spinbox(frame, from_=1, to=10, width=4, textvariable=self.hashtag_count_var).grid(
-            row=4, column=2, sticky="w", padx=(0, 8), pady=(8, 8)
+            row=5, column=2, sticky="w", padx=(0, 8), pady=(8, 8)
         )
         ttk.Label(frame, text="Hashtags stay inside your length limit.", foreground="#666").grid(
-            row=4, column=3, sticky="w", padx=(0, 8), pady=(8, 8)
+            row=5, column=3, sticky="w", padx=(0, 8), pady=(8, 8)
         )
 
     def _handle_mode_change(self) -> None:
@@ -2041,7 +2065,13 @@ class App(tk.Tk):
     def _current_preferences(self) -> FilenamePreferences:
         """Read and normalize naming preferences from the UI."""
         separator = " " if self.word_separator_var.get().startswith("White spaces") else "_"
-        capitalization = "title" if self.capitalization_var.get() == "Title Case" else "lower"
+        capitalization_choice = self.capitalization_var.get()
+        if capitalization_choice == "Title Case":
+            capitalization = "title"
+        elif capitalization_choice == "Natural language":
+            capitalization = "natural"
+        else:
+            capitalization = "lower"
         try:
             chosen_length = int(self.max_filename_length_var.get())
         except (TypeError, tk.TclError, ValueError):
@@ -2494,16 +2524,26 @@ class App(tk.Tk):
             messagebox.showerror("Open folder failed", f"Could not open folder: {exc}")
 
     def _build_row_thumbnail(self, path: Path, size: Tuple[int, int] = (44, 44)) -> Optional[tk.PhotoImage]:
-        """Build a small preview image for image-file rows in the results table."""
-        if path.suffix.lower() not in IMAGE_EXTENSIONS:
-            return None
+        """Build a small preview image for image/video rows in the results table."""
         try:
             from PIL import Image, ImageTk
+            from io import BytesIO
 
-            with Image.open(path) as image:
-                preview = image.convert("RGB")
-                preview.thumbnail(size)
-                return ImageTk.PhotoImage(preview)
+            if path.suffix.lower() in IMAGE_EXTENSIONS:
+                with Image.open(path) as image:
+                    preview = image.convert("RGB")
+                    preview.thumbnail(size)
+                    return ImageTk.PhotoImage(preview)
+
+            if path.suffix.lower() in VIDEO_EXTENSIONS:
+                # Reuse existing first-frame extraction for consistent lightweight video previews.
+                first_frame_jpeg = extract_video_first_frame(path)
+                with Image.open(BytesIO(first_frame_jpeg)) as image:
+                    preview = image.convert("RGB")
+                    preview.thumbnail(size)
+                    return ImageTk.PhotoImage(preview)
+
+            return None
         except Exception:
             # Thumbnail generation is best-effort only; skip previews on decode errors.
             return None
