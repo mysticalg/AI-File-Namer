@@ -1350,7 +1350,9 @@ class App(tk.Tk):
         self.rename_history: List[Tuple[Path, Path]] = []
         self.folder_rename_history: List[Tuple[Path, Path]] = []
         self.ui_queue: queue.Queue = queue.Queue()
-        self.folder_row_paths: Dict[str, Path] = {}
+        # Per-row filesystem targets used by the right-click context menu.
+        # For file suggestions we store the containing folder; for folder rows we store that folder.
+        self.row_open_paths: Dict[str, Path] = {}
         self.sort_state: Dict[str, bool] = {}
         self.debug_events: List[str] = []
         self.debug_window: Optional[tk.Toplevel] = None
@@ -1517,7 +1519,7 @@ class App(tk.Tk):
         # Right-click menu for folder suggestion rows for quick OS navigation/actions.
         self.folder_menu = tk.Menu(self, tearoff=0)
         self.folder_menu.add_command(
-            label="📂 Open Folder in Explorer",
+            label="📂 Open Containing Folder",
             command=self._open_selected_folder_in_explorer,
         )
         self.tree.bind("<Button-3>", self._show_row_context_menu)
@@ -2014,6 +2016,7 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.suggestions.clear()
         self.folder_structure_suggestions.clear()
+        self.row_open_paths.clear()
         self.status_var.set("Collecting files and requesting AI suggestions...")
 
         worker = threading.Thread(
@@ -2108,7 +2111,7 @@ class App(tk.Tk):
 
         self.folder_suggestions.clear()
         self.folder_structure_suggestions.clear()
-        self.folder_row_paths.clear()
+        self.row_open_paths.clear()
         # Clear and repurpose the output grid so users can review folder names before applying.
         self.tree.delete(*self.tree.get_children())
         self.status_var.set("Analyzing folders and generating AI folder names...")
@@ -2198,7 +2201,7 @@ class App(tk.Tk):
             return
 
         self.folder_structure_suggestions.clear()
-        self.folder_row_paths.clear()
+        self.row_open_paths.clear()
         self.tree.delete(*self.tree.get_children())
         self.status_var.set("Analyzing the full folder tree and building an AI restructure plan...")
 
@@ -2454,19 +2457,19 @@ class App(tk.Tk):
         )
 
     def _show_row_context_menu(self, event: tk.Event) -> None:
-        """Show context menu on folder suggestion rows for quick OS folder access."""
+        """Show context menu on suggestion rows for quick OS folder access."""
         row_id = self.tree.identify_row(event.y)
-        if not row_id or row_id not in self.folder_row_paths:
+        if not row_id or row_id not in self.row_open_paths:
             return
         self.tree.selection_set(row_id)
         self.folder_menu.tk_popup(event.x_root, event.y_root)
 
     def _open_selected_folder_in_explorer(self) -> None:
-        """Open the currently selected folder suggestion in the OS file explorer."""
+        """Open the currently selected row's folder in the OS file explorer."""
         selected = self.tree.selection()
         if not selected:
             return
-        folder_path = self.folder_row_paths.get(selected[0])
+        folder_path = self.row_open_paths.get(selected[0])
         if not folder_path or not folder_path.exists():
             messagebox.showwarning("Folder missing", "The selected folder no longer exists.")
             return
@@ -2508,7 +2511,9 @@ class App(tk.Tk):
             if kind == "add":
                 rec: FileSuggestion = msg[1]
                 self.suggestions.append(rec)
-                self.tree.insert("", tk.END, values=(rec.original_name, rec.suggested_name, rec.final_name, "Ready"))
+                row_id = self.tree.insert("", tk.END, values=(rec.original_name, rec.suggested_name, rec.final_name, "Ready"))
+                # File rows should open their containing folder from the context menu.
+                self.row_open_paths[row_id] = rec.path.parent
             elif kind == "error_row":
                 original_name, error_text = msg[1], msg[2]
                 self.tree.insert("", tk.END, values=(original_name, "", "", f"Error: {error_text}"))
@@ -2521,7 +2526,7 @@ class App(tk.Tk):
                     values=(folder_rec.original_name, folder_rec.suggested_name, folder_rec.suggested_name, "Folder Ready"),
                 )
                 # Keep exact paths for right-click Explorer actions.
-                self.folder_row_paths[row_id] = folder_rec.path
+                self.row_open_paths[row_id] = folder_rec.path
             elif kind == "restructure_add":
                 move_rec: FolderStructureSuggestion = msg[1]
                 # Show both old and new structure paths for clearer pre-apply review.
@@ -2534,7 +2539,10 @@ class App(tk.Tk):
                     tk.END,
                     values=(old_path, new_path, transition, f"{move_rec.item_type.title()} Move"),
                 )
-                self.folder_row_paths[row_id] = move_rec.source_path
+                # File move previews should open the parent folder; folder previews open that folder directly.
+                self.row_open_paths[row_id] = (
+                    move_rec.source_path.parent if move_rec.item_type == "file" else move_rec.source_path
+                )
             elif kind == "status":
                 self.status_var.set(msg[1])
             elif kind == "ollama_models":
