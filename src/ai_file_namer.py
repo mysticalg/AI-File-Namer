@@ -2563,6 +2563,19 @@ class App(tk.Tk):
         removed = remove_empty_folders(folder, recursive=True)
         self.status_var.set(f"Empty-folder cleanup complete: removed {removed} folder(s).")
 
+    def _insert_result_row(self, values: Tuple[str, str, str, str], image: Optional[tk.PhotoImage] = None) -> str:
+        """Insert one table row safely and set columns individually.
+
+        Setting column values via `tree.set` avoids Tcl argument edge-cases when AI text
+        includes characters that can confuse direct variadic option formatting.
+        """
+        row_id = self.tree.insert("", tk.END, text="", image=image or "")
+        self.tree.set(row_id, "original", values[0])
+        self.tree.set(row_id, "suggestion", values[1])
+        self.tree.set(row_id, "final", values[2])
+        self.tree.set(row_id, "status", values[3])
+        return row_id
+
     def _process_ui_queue(self) -> None:
         while True:
             try:
@@ -2575,12 +2588,9 @@ class App(tk.Tk):
                 rec: FileSuggestion = msg[1]
                 self.suggestions.append(rec)
                 row_thumbnail = self._build_row_thumbnail(rec.path)
-                row_id = self.tree.insert(
-                    "",
-                    tk.END,
-                    text="",
-                    image=row_thumbnail,
+                row_id = self._insert_result_row(
                     values=(rec.original_name, rec.suggested_name, rec.final_name, "Ready"),
+                    image=row_thumbnail,
                 )
                 # File rows should open their containing folder from the context menu.
                 self.row_open_paths[row_id] = rec.path.parent
@@ -2588,14 +2598,11 @@ class App(tk.Tk):
                     self.row_thumbnail_images[row_id] = row_thumbnail
             elif kind == "error_row":
                 original_name, error_text = msg[1], msg[2]
-                self.tree.insert("", tk.END, text="", values=(original_name, "", "", f"Error: {error_text}"))
+                self._insert_result_row(values=(original_name, "", "", f"Error: {error_text}"))
             elif kind == "folder_add":
                 folder_rec: FolderSuggestion = msg[1]
                 # Reuse the same output table so folder rename previews are visible before apply.
-                row_id = self.tree.insert(
-                    "",
-                    tk.END,
-                    text="",
+                row_id = self._insert_result_row(
                     values=(folder_rec.original_name, folder_rec.suggested_name, folder_rec.suggested_name, "Folder Ready"),
                 )
                 # Keep exact paths for right-click Explorer actions.
@@ -2607,10 +2614,7 @@ class App(tk.Tk):
                     move_rec.original_relative,
                     move_rec.target_relative,
                 )
-                row_id = self.tree.insert(
-                    "",
-                    tk.END,
-                    text="",
+                row_id = self._insert_result_row(
                     values=(old_path, new_path, transition, f"{move_rec.item_type.title()} Move"),
                 )
                 # File move previews should open the parent folder; folder previews open that folder directly.
