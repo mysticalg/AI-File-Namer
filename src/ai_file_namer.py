@@ -40,6 +40,7 @@ DEFAULT_OPENAI_OAUTH_CLIENT_ID = os.environ.get("OPENAI_OAUTH_CLIENT_ID", "")
 DEFAULT_OPENAI_OAUTH_AUTH_URL = "https://auth.openai.com/oauth/authorize"
 DEFAULT_OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 DEFAULT_OPENAI_OAUTH_SCOPE = "openid profile email offline_access"
+DEFAULT_OPENAI_OAUTH_AUDIENCE = os.environ.get("OPENAI_OAUTH_AUDIENCE", "api.openai.com")
 DEFAULT_OPENAI_OAUTH_REDIRECT_HOST = "127.0.0.1"
 DEFAULT_OPENAI_OAUTH_REDIRECT_PORT = 8765
 DEFAULT_OPENAI_OAUTH_REDIRECT_URI = os.environ.get(
@@ -138,12 +139,21 @@ class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
 class OpenAIOAuthClient:
     """Handle OpenAI OAuth login and token exchange for desktop app sessions."""
 
-    def __init__(self, client_id: str, auth_url: str, token_url: str, scope: str, redirect_uri: str):
+    def __init__(
+        self,
+        client_id: str,
+        auth_url: str,
+        token_url: str,
+        scope: str,
+        redirect_uri: str,
+        audience: str,
+    ):
         self.client_id = client_id.strip()
         self.auth_url = auth_url.strip()
         self.token_url = token_url.strip()
         self.scope = scope.strip()
         self.redirect_uri = redirect_uri.strip() or DEFAULT_OPENAI_OAUTH_REDIRECT_URI
+        self.audience = audience.strip()
 
     def authorize(self, timeout_seconds: int = 180) -> Dict[str, Any]:
         """Run OAuth Authorization Code + PKCE flow and return token payload."""
@@ -153,12 +163,16 @@ class OpenAIOAuthClient:
             raise ValueError(
                 "OpenAI OAuth Client ID is missing. Add it in AI Provider settings or set OPENAI_OAUTH_CLIENT_ID."
             )
+        if not self.client_id.startswith("app_"):
+            raise ValueError("OpenAI OAuth Client ID should start with 'app_'.")
 
         parsed_redirect = urllib.parse.urlparse(self.redirect_uri)
         if parsed_redirect.scheme != "http" or not parsed_redirect.hostname or not parsed_redirect.port:
             raise ValueError(
                 "OpenAI redirect URI must be an http://127.0.0.1:<port>/path style local callback URL."
             )
+        if parsed_redirect.hostname not in {"127.0.0.1", "localhost"}:
+            raise ValueError("OpenAI redirect URI host must be 127.0.0.1 or localhost for desktop callback flow.")
         redirect_uri = self.redirect_uri
         verifier = secrets.token_urlsafe(64)
         state = secrets.token_urlsafe(24)
@@ -180,6 +194,7 @@ class OpenAIOAuthClient:
                     "state": state,
                     "code_challenge": challenge,
                     "code_challenge_method": "S256",
+                    **({"audience": self.audience} if self.audience else {}),
                 }
             )
             auth_link = f"{self.auth_url}?{query}"
@@ -1338,6 +1353,7 @@ class App(tk.Tk):
         self.openai_auth_url_var = tk.StringVar(value=str(loaded_settings.get("openai_auth_url", DEFAULT_OPENAI_OAUTH_AUTH_URL)))
         self.openai_token_url_var = tk.StringVar(value=str(loaded_settings.get("openai_token_url", DEFAULT_OPENAI_OAUTH_TOKEN_URL)))
         self.openai_scope_var = tk.StringVar(value=str(loaded_settings.get("openai_scope", DEFAULT_OPENAI_OAUTH_SCOPE)))
+        self.openai_audience_var = tk.StringVar(value=str(loaded_settings.get("openai_audience", DEFAULT_OPENAI_OAUTH_AUDIENCE)))
         self.openai_redirect_uri_var = tk.StringVar(value=str(loaded_settings.get("openai_redirect_uri", DEFAULT_OPENAI_OAUTH_REDIRECT_URI)))
         self.include_date_var = tk.BooleanVar(value=bool(loaded_settings.get("include_date", False)))
         self.recursive_scan_var = tk.BooleanVar(value=bool(loaded_settings.get("recursive_scan", True)))
@@ -1584,6 +1600,7 @@ class App(tk.Tk):
             "openai_auth_url": self.openai_auth_url_var.get(),
             "openai_token_url": self.openai_token_url_var.get(),
             "openai_scope": self.openai_scope_var.get(),
+            "openai_audience": self.openai_audience_var.get(),
             "openai_redirect_uri": self.openai_redirect_uri_var.get(),
             "include_date": self.include_date_var.get(),
             "recursive_scan": self.recursive_scan_var.get(),
@@ -1625,6 +1642,7 @@ class App(tk.Tk):
             self.openai_auth_url_var,
             self.openai_token_url_var,
             self.openai_scope_var,
+            self.openai_audience_var,
             self.openai_redirect_uri_var,
             self.include_date_var,
             self.recursive_scan_var,
@@ -1712,6 +1730,16 @@ class App(tk.Tk):
             self.status_var.set("OpenAI OAuth Client ID is missing. Configure it, then retry Connect OpenAI.")
             return
 
+        # Preflight validation catches common config mismatch before opening browser.
+        auth_host = urllib.parse.urlparse(self.openai_auth_url_var.get().strip()).hostname or ""
+        token_host = urllib.parse.urlparse(self.openai_token_url_var.get().strip()).hostname or ""
+        if auth_host != "auth.openai.com" or token_host != "auth.openai.com":
+            messagebox.showwarning(
+                "OAuth endpoint mismatch",
+                "OpenAI OAuth endpoints should normally use auth.openai.com.\n\n"
+                "If you changed auth/token URLs intentionally for a compatible provider, ignore this warning.",
+            )
+
         self.oauth_in_progress = True
         if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
             self.oauth_connect_button.configure(state="disabled")
@@ -1727,6 +1755,7 @@ class App(tk.Tk):
                 auth_url=self.openai_auth_url_var.get(),
                 token_url=self.openai_token_url_var.get(),
                 scope=self.openai_scope_var.get(),
+                audience=self.openai_audience_var.get(),
                 redirect_uri=self.openai_redirect_uri_var.get(),
             )
             token_payload = oauth_client.authorize()
@@ -1859,9 +1888,13 @@ class App(tk.Tk):
 
         ttk.Label(frame, text="OpenAI OAuth Client ID").grid(row=3, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Entry(frame, textvariable=self.openai_client_id_var).grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-        ttk.Label(frame, text="OpenAI Redirect URI").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(frame, text="OpenAI OAuth Audience").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
+        audience_entry = ttk.Entry(frame, textvariable=self.openai_audience_var)
+        audience_entry.grid(row=4, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self._attach_tooltip(audience_entry, "Usually api.openai.com. Leave default unless OpenAI support says otherwise.")
+        ttk.Label(frame, text="OpenAI Redirect URI").grid(row=5, column=0, sticky="w", padx=8, pady=(8, 0))
         redirect_entry = ttk.Entry(frame, textvariable=self.openai_redirect_uri_var)
-        redirect_entry.grid(row=4, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        redirect_entry.grid(row=5, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
         self._attach_tooltip(
             redirect_entry,
             "Must match your OpenAI app exactly (e.g. http://127.0.0.1:8765/oauth/callback).",
@@ -1870,10 +1903,10 @@ class App(tk.Tk):
             frame,
             text="Tip: Set OPENAI_OAUTH_CLIENT_ID env var to prefill this automatically.",
             foreground="#666",
-        ).grid(row=5, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
+        ).grid(row=6, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
 
         oauth_controls = ttk.Frame(frame)
-        oauth_controls.grid(row=6, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
+        oauth_controls.grid(row=7, column=1, sticky="w", padx=(0, 8), pady=(8, 0))
         self.oauth_connect_button = ttk.Button(oauth_controls, text="🔐 Connect OpenAI", command=self._start_openai_oauth_login)
         self.oauth_connect_button.pack(side=tk.LEFT)
         self.oauth_disconnect_button = ttk.Button(oauth_controls, text="🧹 Forget Token", command=self._clear_openai_token)
@@ -1886,19 +1919,19 @@ class App(tk.Tk):
         oauth_setup_button.pack(side=tk.LEFT, padx=(6, 0))
         self._attach_tooltip(oauth_setup_button, "Open OpenAI docs/settings to create or find your OAuth Client ID.")
 
-        ttk.Label(frame, text="Token Status").grid(row=6, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(frame, text="Token Status").grid(row=7, column=0, sticky="w", padx=8, pady=(8, 0))
         self.oauth_status_label = ttk.Label(frame, text="Not connected", foreground="#666")
-        self.oauth_status_label.grid(row=7, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
+        self.oauth_status_label.grid(row=8, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
 
-        ttk.Label(frame, text="⏱️ AI timeout (sec)").grid(row=8, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(frame, text="⏱️ AI timeout (sec)").grid(row=9, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Spinbox(frame, from_=30, to=3600, increment=30, textvariable=self.ai_timeout_seconds_var, width=10).grid(
-            row=8, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
+            row=9, column=1, sticky="w", padx=(0, 8), pady=(8, 0)
         )
         ttk.Label(
             frame,
             text="Tip: Connect OpenAI launches browser OAuth and returns here automatically (no token copy/paste).",
             foreground="#666",
-        ).grid(row=9, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
+        ).grid(row=10, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 8))
 
         self._handle_mode_change()
         self._refresh_oauth_status_label()
@@ -2640,6 +2673,15 @@ class App(tk.Tk):
                 self.status_var.set("OpenAI OAuth connected. Token saved for future runs.")
             elif kind == "oauth_error":
                 error_text = str(msg[1])
+                if "unknown_error" in error_text:
+                    error_text = (
+                        f"{error_text}\n\n"
+                        "OpenAI returned an unknown_error before callback. Double-check:\n"
+                        "• Client ID starts with app_ and is active\n"
+                        "• Redirect URI in this app exactly matches OpenAI app settings\n"
+                        "• OAuth Audience (if required) matches your OpenAI app configuration\n"
+                        "• Auth/Token URLs are auth.openai.com"
+                    )
                 self.status_var.set(f"OpenAI OAuth failed: {error_text}")
                 messagebox.showerror("OpenAI OAuth failed", error_text)
             elif kind == "oauth_done":
