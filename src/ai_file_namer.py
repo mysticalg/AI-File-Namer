@@ -145,6 +145,16 @@ def validate_openai_oauth_urls(auth_url: str, token_url: str) -> None:
             raise ValueError("OpenAI token URL should end with /oauth/token.")
 
 
+def build_openai_oauth_client_id_guidance() -> str:
+    """Explain why OAuth needs a client ID while still using user-login consent."""
+    return (
+        "OpenAI OAuth requires a Client ID because OAuth identifies the requesting app. "
+        "You still sign in with your OpenAI account and approve permissions in-browser; "
+        "the app then receives an access token. No client secret or manual key paste is required "
+        "for this desktop PKCE flow."
+    )
+
+
 def describe_capitalization_mode(mode: str) -> str:
     """Return human-readable wording for naming-style instructions sent to the model."""
     if mode == "title":
@@ -2074,7 +2084,7 @@ class App(tk.Tk):
         if not self.openai_client_id_var.get().strip():
             messagebox.showerror(
                 "OpenAI OAuth Client ID missing",
-                "OpenAI browser OAuth requires a configured Client ID.\n\n"
+                f"{build_openai_oauth_client_id_guidance()}\n\n"
                 "Set OPENAI_OAUTH_CLIENT_ID (recommended) or enter a Client ID in AI Provider settings, "
                 "then click Connect OpenAI again.\n\n"
                 "After that, sign-in happens in-browser and returns to this app automatically—"
@@ -2276,7 +2286,12 @@ class App(tk.Tk):
         )
 
         ttk.Label(frame, text="OpenAI OAuth Client ID").grid(row=4, column=0, sticky="w", padx=8, pady=(8, 0))
-        ttk.Entry(frame, textvariable=self.openai_client_id_var).grid(row=4, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        client_id_entry = ttk.Entry(frame, textvariable=self.openai_client_id_var)
+        client_id_entry.grid(row=4, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
+        self._attach_tooltip(
+            client_id_entry,
+            "Required for OAuth because it identifies this app. User still logs in and consents in browser.",
+        )
         ttk.Label(frame, text="OpenAI OAuth Audience").grid(row=5, column=0, sticky="w", padx=8, pady=(8, 0))
         audience_entry = ttk.Entry(frame, textvariable=self.openai_audience_var)
         audience_entry.grid(row=5, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
@@ -2290,7 +2305,7 @@ class App(tk.Tk):
         )
         ttk.Label(
             frame,
-            text="OAuth is optional. API key + remote model is enough for OpenAI remote mode.",
+            text="OAuth is optional. OAuth login still requires an app Client ID; API key works without OAuth setup.",
             foreground="#666",
         ).grid(row=7, column=1, sticky="w", padx=(0, 8), pady=(4, 0))
 
@@ -3166,7 +3181,7 @@ class App(tk.Tk):
                     error_text = (
                         f"{error_text}\n\n"
                         "OpenAI returned an unknown_error before callback. Double-check:\n"
-                        "• Client ID starts with app_ and is active\n"
+                        "• Client ID starts with app_ and is active (OAuth requires a Client ID)\n"
                         "• Redirect URI in this app exactly matches OpenAI app settings\n"
                         "• OAuth Audience (if required) matches your OpenAI app configuration\n"
                         "• Auth/Token URLs are auth.openai.com"

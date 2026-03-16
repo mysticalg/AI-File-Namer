@@ -38,6 +38,7 @@ from src.ai_file_namer import (
     build_openai_rate_limit_guidance,
     normalize_openai_oauth_audience,
     validate_openai_oauth_urls,
+    build_openai_oauth_client_id_guidance,
 )
 
 
@@ -79,6 +80,12 @@ class FilenameUtilsTests(unittest.TestCase):
 
     def test_validate_openai_oauth_urls_accepts_openai_defaults(self):
         validate_openai_oauth_urls("https://auth.openai.com/oauth/authorize", "https://auth.openai.com/oauth/token")
+
+    def test_build_openai_oauth_client_id_guidance_explains_login_and_client_id(self):
+        message = build_openai_oauth_client_id_guidance()
+        self.assertIn("requires a Client ID", message)
+        self.assertIn("sign in", message)
+        self.assertIn("access token", message)
 
     def test_parse_openai_model_names_filters_non_chat_ids(self):
         payload = {
