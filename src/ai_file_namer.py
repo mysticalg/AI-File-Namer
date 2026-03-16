@@ -41,7 +41,7 @@ DEFAULT_OPENAI_OAUTH_CLIENT_ID = os.environ.get("OPENAI_OAUTH_CLIENT_ID", "")
 DEFAULT_OPENAI_OAUTH_AUTH_URL = "https://auth.openai.com/oauth/authorize"
 DEFAULT_OPENAI_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 DEFAULT_OPENAI_OAUTH_SCOPE = "openid profile email offline_access"
-DEFAULT_OPENAI_OAUTH_AUDIENCE = os.environ.get("OPENAI_OAUTH_AUDIENCE", "api.openai.com")
+DEFAULT_OPENAI_OAUTH_AUDIENCE = os.environ.get("OPENAI_OAUTH_AUDIENCE", "")
 DEFAULT_OPENAI_OAUTH_REDIRECT_HOST = "127.0.0.1"
 DEFAULT_OPENAI_OAUTH_REDIRECT_PORT = 8765
 DEFAULT_OPENAI_OAUTH_REDIRECT_URI = os.environ.get(
@@ -118,6 +118,33 @@ def build_openai_rate_limit_guidance(retry_after_seconds: Optional[float]) -> st
     )
 
 
+def normalize_openai_oauth_audience(audience: str) -> str:
+    """Normalize audience values so legacy defaults do not break OpenAI OAuth login."""
+    cleaned = (audience or "").strip()
+    if cleaned in {"api.openai.com", "https://api.openai.com", "https://api.openai.com/"}:
+        # OpenAI's desktop OAuth flows commonly do not require `audience`; omit legacy value.
+        return ""
+    return cleaned
+
+
+def validate_openai_oauth_urls(auth_url: str, token_url: str) -> None:
+    """Validate OAuth endpoint URLs and raise actionable errors for common misconfiguration."""
+    auth_parsed = urllib.parse.urlparse((auth_url or "").strip())
+    token_parsed = urllib.parse.urlparse((token_url or "").strip())
+
+    if auth_parsed.scheme != "https" or token_parsed.scheme != "https":
+        raise ValueError("OpenAI OAuth auth/token URLs must use https.")
+    if not auth_parsed.netloc or not token_parsed.netloc:
+        raise ValueError("OpenAI OAuth auth/token URLs are invalid.")
+
+    # Strongly guide default OpenAI configuration while still allowing compatible providers.
+    if auth_parsed.hostname == "auth.openai.com" and token_parsed.hostname == "auth.openai.com":
+        if not auth_parsed.path.endswith("/oauth/authorize"):
+            raise ValueError("OpenAI auth URL should end with /oauth/authorize.")
+        if not token_parsed.path.endswith("/oauth/token"):
+            raise ValueError("OpenAI token URL should end with /oauth/token.")
+
+
 def describe_capitalization_mode(mode: str) -> str:
     """Return human-readable wording for naming-style instructions sent to the model."""
     if mode == "title":
@@ -191,6 +218,8 @@ class OpenAIOAuthClient:
         if not self.client_id.startswith("app_"):
             raise ValueError("OpenAI OAuth Client ID should start with 'app_'.")
 
+        validate_openai_oauth_urls(self.auth_url, self.token_url)
+
         parsed_redirect = urllib.parse.urlparse(self.redirect_uri)
         if parsed_redirect.scheme != "http" or not parsed_redirect.hostname or not parsed_redirect.port:
             raise ValueError(
@@ -199,6 +228,7 @@ class OpenAIOAuthClient:
         if parsed_redirect.hostname not in {"127.0.0.1", "localhost"}:
             raise ValueError("OpenAI redirect URI host must be 127.0.0.1 or localhost for desktop callback flow.")
         redirect_uri = self.redirect_uri
+        normalized_audience = normalize_openai_oauth_audience(self.audience)
         verifier = secrets.token_urlsafe(64)
         state = secrets.token_urlsafe(24)
         challenge = _pkce_code_challenge(verifier)
@@ -219,11 +249,13 @@ class OpenAIOAuthClient:
                     "state": state,
                     "code_challenge": challenge,
                     "code_challenge_method": "S256",
-                    **({"audience": self.audience} if self.audience else {}),
+                    **({"audience": normalized_audience} if normalized_audience else {}),
                 }
             )
             auth_link = f"{self.auth_url}?{query}"
-            webbrowser.open(auth_link, new=1)
+            browser_opened = webbrowser.open(auth_link, new=1)
+            if browser_opened is False:
+                raise RuntimeError("Could not open a web browser automatically for OAuth login.")
             callback_server.handle_request()
             result = getattr(callback_server, "auth_result", None)
 
@@ -2052,6 +2084,13 @@ class App(tk.Tk):
             return
 
         # Preflight validation catches common config mismatch before opening browser.
+        try:
+            validate_openai_oauth_urls(self.openai_auth_url_var.get(), self.openai_token_url_var.get())
+        except ValueError as exc:
+            messagebox.showerror("OAuth configuration error", str(exc))
+            self.status_var.set(f"OpenAI OAuth config error: {exc}")
+            return
+
         auth_host = urllib.parse.urlparse(self.openai_auth_url_var.get().strip()).hostname or ""
         token_host = urllib.parse.urlparse(self.openai_token_url_var.get().strip()).hostname or ""
         if auth_host != "auth.openai.com" or token_host != "auth.openai.com":
@@ -2060,6 +2099,12 @@ class App(tk.Tk):
                 "OpenAI OAuth endpoints should normally use auth.openai.com.\n\n"
                 "If you changed auth/token URLs intentionally for a compatible provider, ignore this warning.",
             )
+
+        normalized_audience = normalize_openai_oauth_audience(self.openai_audience_var.get())
+        if normalized_audience != self.openai_audience_var.get().strip():
+            # Keep UI values aligned with what will actually be sent to reduce confusion.
+            self.openai_audience_var.set(normalized_audience)
+            self.status_var.set("OAuth Audience reset to default (blank) for OpenAI compatibility.")
 
         self.oauth_in_progress = True
         if self.oauth_connect_button and self.oauth_connect_button.winfo_exists():
@@ -2235,7 +2280,7 @@ class App(tk.Tk):
         ttk.Label(frame, text="OpenAI OAuth Audience").grid(row=5, column=0, sticky="w", padx=8, pady=(8, 0))
         audience_entry = ttk.Entry(frame, textvariable=self.openai_audience_var)
         audience_entry.grid(row=5, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))
-        self._attach_tooltip(audience_entry, "Usually api.openai.com. Leave default unless OpenAI support says otherwise.")
+        self._attach_tooltip(audience_entry, "Usually leave blank for OpenAI. Set only if OpenAI support instructs a specific audience.")
         ttk.Label(frame, text="OpenAI Redirect URI").grid(row=6, column=0, sticky="w", padx=8, pady=(8, 0))
         redirect_entry = ttk.Entry(frame, textvariable=self.openai_redirect_uri_var)
         redirect_entry.grid(row=6, column=1, sticky="ew", padx=(0, 8), pady=(8, 0))

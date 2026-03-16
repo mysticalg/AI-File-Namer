@@ -36,6 +36,8 @@ from src.ai_file_namer import (
     parse_openai_model_names,
     parse_retry_after_seconds,
     build_openai_rate_limit_guidance,
+    normalize_openai_oauth_audience,
+    validate_openai_oauth_urls,
 )
 
 
@@ -65,6 +67,18 @@ class FilenameUtilsTests(unittest.TestCase):
         message = build_openai_rate_limit_guidance(2)
         self.assertIn("single request", message)
         self.assertIn("Retry after about 2 second(s)", message)
+
+    def test_normalize_openai_oauth_audience_drops_legacy_default(self):
+        self.assertEqual(normalize_openai_oauth_audience("api.openai.com"), "")
+        self.assertEqual(normalize_openai_oauth_audience("https://api.openai.com"), "")
+        self.assertEqual(normalize_openai_oauth_audience("custom-audience"), "custom-audience")
+
+    def test_validate_openai_oauth_urls_rejects_non_https(self):
+        with self.assertRaises(ValueError):
+            validate_openai_oauth_urls("http://auth.openai.com/oauth/authorize", "https://auth.openai.com/oauth/token")
+
+    def test_validate_openai_oauth_urls_accepts_openai_defaults(self):
+        validate_openai_oauth_urls("https://auth.openai.com/oauth/authorize", "https://auth.openai.com/oauth/token")
 
     def test_parse_openai_model_names_filters_non_chat_ids(self):
         payload = {
