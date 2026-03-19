@@ -2,6 +2,8 @@
 
 A Tkinter desktop app to bulk-rename images and videos using an AI model.
 
+Live page: [mysticalg.github.io/AI-File-Namer](https://mysticalg.github.io/AI-File-Namer/)
+
 ## Features
 - Select a folder and scan image/video files (optionally recursive through subfolders).
 - Configure AI as:
@@ -71,3 +73,8 @@ All outputs are uploaded as workflow artifacts:
 - `macos-installers`
 
 > Note: unsigned macOS/Windows installers may trigger security prompts until code-signing is configured.
+
+## Support
+
+If you'd like to support this project, you can buy me a coffee:
+[buymeacoffee.com/dhooksterm](https://buymeacoffee.com/dhooksterm)
